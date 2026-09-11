@@ -5,7 +5,7 @@ Proof of Concept Implementation for IQM & Deutsche Bahn Use Case
 This module implements a quantum-classical hybrid solver for the Maximum Weighted Independent Set (MWIS) problem
 on a conflict graph of railway rolling stock cycles, with automatic constraint pruning for NISQ-era hardware resilience.
 
-Compliance Level: QCentroid Platform v1.0
+Compliance Level: QCentroid Platform v1.0 with IQM Resonance Integration
 """
 
 import json
@@ -63,6 +63,108 @@ class ConflictEdge:
     """Represents a conflict between two cycles (shared trip)."""
     cycle_1: str
     cycle_2: str
+
+
+class IQMBackendManager:
+    """
+    Manages connection to IQM Resonance hardware.
+    Handles token authentication, quantum computer selection, and circuit execution.
+    """
+    
+    def __init__(self, iqm_token: str, quantum_computer: str = "emerald", api_url: str = "https://resonance.iqm.tech/"):
+        """
+        Initialize IQM Resonance backend connection.
+        
+        Args:
+            iqm_token: Authentication token for IQM API
+            quantum_computer: Quantum computer name ('emerald', 'sirius', etc.)
+            api_url: API endpoint URL for IQM Resonance
+            
+        Raises:
+            ValueError: If token is not provided or connection fails
+        """
+        if not iqm_token:
+            raise ValueError("Error: IQM token is required but was not provided. Set 'iqm_token' in solver_params.")
+        
+        self.iqm_token = iqm_token
+        self.quantum_computer = quantum_computer
+        self.api_url = api_url
+        self.backend = None
+        self._connect()
+    
+    def _connect(self):
+        """
+        Establish connection to IQM Resonance hardware.
+        
+        Raises:
+            Exception: If connection to IQM hardware fails
+        """
+        if not IQM_AVAILABLE:
+            raise RuntimeError("IQM Qiskit plugin is not installed. Install with: pip install iqm-client[qiskit]")
+        
+        try:
+            logger.info(f"Connecting to IQM Resonance at {self.api_url}...")
+            logger.info(f"Quantum computer: {self.quantum_computer}")
+            
+            provider = IQMProvider(
+                url=self.api_url,
+                quantum_computer=self.quantum_computer,
+                token=self.iqm_token
+            )
+            
+            self.backend = provider.get_backend()
+            logger.info(f"✓ Successfully connected to IQM Resonance backend: {self.backend.name}")
+            logger.info(f"✓ Backend properties: {self.backend.max_qubits} qubits available")
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to IQM Resonance: {str(e)}")
+            raise RuntimeError(f"IQM connection failed: {str(e)}")
+    
+    def get_backend(self):
+        """Return the connected backend."""
+        if self.backend is None:
+            raise RuntimeError("Backend is not connected. Call _connect() first.")
+        return self.backend
+    
+    def run_circuit(self, circuit: QuantumCircuit, shots: int = 1024, use_timeslot: bool = False) -> Dict[str, Any]:
+        """
+        Execute a quantum circuit on IQM Resonance hardware.
+        
+        Args:
+            circuit: Qiskit QuantumCircuit to execute
+            shots: Number of measurement shots
+            use_timeslot: Whether to use timeslot optimization
+            
+        Returns:
+            Dictionary with measurement counts and metadata
+        """
+        if self.backend is None:
+            raise RuntimeError("Backend is not connected.")
+        
+        try:
+            logger.info(f"Transpiling circuit for IQM backend ({self.quantum_computer})...")
+            qc_transpiled = transpile(circuit, backend=self.backend, optimization_level=3)
+            
+            logger.info(f"Executing circuit with {shots} shots on IQM Resonance...")
+            job = self.backend.run(qc_transpiled, shots=shots, use_timeslot=use_timeslot)
+            
+            logger.info(f"Job submitted: {job.job_id() if hasattr(job, 'job_id') else 'Unknown'}")
+            result = job.result()
+            counts = result.get_counts()
+            
+            logger.info(f"✓ Execution completed. Received {sum(counts.values())} measurement results.")
+            
+            return {
+                "counts": counts,
+                "backend_name": self.backend.name,
+                "shots": shots,
+                "quantum_computer": self.quantum_computer,
+                "success": True
+            }
+        
+        except Exception as e:
+            logger.error(f"Circuit execution on IQM failed: {str(e)}")
+            raise RuntimeError(f"IQM execution error: {str(e)}")
 
 
 class VisualizationAssetGenerator:
@@ -188,7 +290,8 @@ class VisualizationAssetGenerator:
         nodes_pruned: int,
         coverage_rate: float,
         conflict_graph: nx.Graph,
-        execution_time: float
+        execution_time: float,
+        backend_info: str = "Qiskit Simulator"
     ) -> str:
         """
         Generate a self-contained HTML report summarizing the solution.
@@ -200,6 +303,7 @@ class VisualizationAssetGenerator:
             coverage_rate: Coverage ratio (0.0 to 1.0)
             conflict_graph: NetworkX graph for statistics
             execution_time: Execution time in seconds
+            backend_info: Information about the quantum backend used
             
         Returns:
             Path to saved HTML file
@@ -396,6 +500,16 @@ class VisualizationAssetGenerator:
             background: #fdeaa8;
             color: #d68910;
         }}
+        
+        .backend-info {{
+            background: #e3f2fd;
+            border-left: 4px solid #2196f3;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            font-size: 0.95em;
+            color: #1565c0;
+        }}
     </style>
 </head>
 <body>
@@ -406,6 +520,11 @@ class VisualizationAssetGenerator:
         </div>
         
         <div class="content">
+            <!-- Backend Info -->
+            <div class="backend-info">
+                <strong>🔧 Backend:</strong> {backend_info}
+            </div>
+            
             <!-- Key Metrics -->
             <div class="metrics-grid">
                 <div class="metric-card success">
@@ -840,7 +959,7 @@ class RailwayRollingStockSolver:
         
         return G
     
-    def solve(self, backend=None, qaoa_p: int = 1, shots: int = 1000) -> Tuple[List[str], Dict[str, Any]]:
+    def solve(self, backend=None, qaoa_p: int = 1, shots: int = 1000) -> Tuple[List[str], Dict[str, Any], Set[str]]:
         """
         Execute the complete solving pipeline.
         
@@ -850,7 +969,7 @@ class RailwayRollingStockSolver:
             shots: Number of quantum shots
             
         Returns:
-            Tuple of (selected_cycle_ids, solver_metrics)
+            Tuple of (selected_cycle_ids, solver_metrics, pruned_nodes_set)
         """
         start_time = time.time()
         
@@ -898,10 +1017,10 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
     """
     Main entry point for the QCentroid Platform.
     
-    QCentroid Contract Compliance:
+    QCentroid Contract Compliance with IQM Resonance Integration:
     - Accepts input_data with 'nodes' and 'edges' keys
-    - Reads 'iqm_token', 'shots', 'subgraph_size' from solver_params
-    - Integrates with IQM Resonance or falls back to Qiskit simulator
+    - Reads 'iqm_token', 'quantum_computer', 'shots' from solver_params
+    - Integrates with IQM Resonance hardware via IQMProvider
     - Performs constraint pruning to ensure 100% feasible solution
     - Generates visualization assets for QCentroid dashboard
     - Returns JSON-serializable dictionary with solution and metrics
@@ -911,11 +1030,13 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
             - 'nodes': List[Dict] with 'id' (str), 'weight' (float), optional 'trips' (List[str])
             - 'edges': List[List[str]] with conflict pairs
         
-        solver_params: Optional parameters:
-            - 'iqm_token': IQM API token for hardware access
-            - 'shots': Number of quantum measurement shots (default 1000)
-            - 'qaoa_depth': QAOA circuit depth p (default 1)
-            - 'subgraph_size': Subgraph size for distributed solving (default None)
+        solver_params: Configuration parameters:
+            - 'iqm_token': (Optional) IQM API token for hardware access. If provided, uses IQM Resonance
+            - 'quantum_computer': (Optional) Quantum computer name ('emerald', 'sirius', etc., default: 'emerald')
+            - 'shots': (Optional) Number of quantum measurement shots (default 1024)
+            - 'qaoa_depth': (Optional) QAOA circuit depth p (default 1)
+            - 'use_timeslot': (Optional) Use IQM timeslot optimization (default False)
+            - 'api_url': (Optional) IQM API endpoint (default: 'https://resonance.iqm.tech/')
         
         extra_arguments: Runtime arguments injected by QCentroid platform
     
@@ -927,6 +1048,7 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
         - 'coverage_rate': float, ratio of solution weight to total available weight
         - 'execution_metrics': dict with detailed timing and solver stats
         - 'assets': dict with paths to generated visualization assets
+        - 'backend_used': str, information about backend used
     """
     
     logger.info("=" * 80)
@@ -951,26 +1073,47 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
     
     # Extract solver parameters
     iqm_token = solver_params.get('iqm_token')
-    shots = solver_params.get('shots', 1000)
+    quantum_computer = solver_params.get('quantum_computer', 'emerald')
+    api_url = solver_params.get('api_url', 'https://resonance.iqm.tech/')
+    shots = solver_params.get('shots', 1024)
     qaoa_depth = solver_params.get('qaoa_depth', 1)
-    subgraph_size = solver_params.get('subgraph_size')
+    use_timeslot = solver_params.get('use_timeslot', False)
     
-    # Initialize backend
+    # Initialize backend and determine backend type
     backend = None
-    if iqm_token and IQM_AVAILABLE:
+    backend_info = "Qiskit Simulator (Fallback)"
+    
+    if iqm_token:
+        # Try to connect to IQM Resonance
         try:
-            logger.info("Attempting to connect to IQM Resonance hardware...")
-            provider = IQMProvider(iqm_token)
-            backend = provider.get_backend()
-            logger.info("✓ Connected to IQM Resonance hardware.")
+            logger.info("Initializing IQM Resonance backend...")
+            iqm_manager = IQMBackendManager(
+                iqm_token=iqm_token,
+                quantum_computer=quantum_computer,
+                api_url=api_url
+            )
+            backend = iqm_manager.get_backend()
+            backend_info = f"IQM Resonance ({quantum_computer})"
+            logger.info(f"✓ Successfully connected to IQM Resonance backend")
+            
         except Exception as e:
-            logger.warning(f"IQM hardware unavailable ({e}). Falling back to Qiskit simulator.")
-            backend = None
-    elif QISKIT_AVAILABLE:
-        logger.info("Using Qiskit AerSimulator (IQM token not provided or IQM unavailable).")
-        backend = AerSimulator()
+            logger.warning(f"IQM Resonance connection failed: {e}")
+            logger.info("Falling back to Qiskit Simulator...")
+            if QISKIT_AVAILABLE:
+                backend = AerSimulator()
+                backend_info = "Qiskit AerSimulator (Fallback from IQM Error)"
+            else:
+                logger.warning("Qiskit not available. Using classical greedy solver.")
+                backend_info = "Classical Greedy Heuristic"
     else:
-        logger.warning("Neither IQM nor Qiskit available. Using classical greedy solver.")
+        # No IQM token provided, use Qiskit simulator or greedy
+        if QISKIT_AVAILABLE:
+            logger.info("Using Qiskit AerSimulator (no IQM token provided).")
+            backend = AerSimulator()
+            backend_info = "Qiskit AerSimulator"
+        else:
+            logger.warning("Neither IQM nor Qiskit available. Using classical greedy solver.")
+            backend_info = "Classical Greedy Heuristic"
     
     # Create solver instance
     solver = RailwayRollingStockSolver(nodes, edges)
@@ -1003,7 +1146,8 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
             metrics.get('nodes_pruned', 0),
             metrics.get('coverage_rate', 0.0),
             solver.conflict_graph,
-            metrics.get('execution_time_seconds', 0.0)
+            metrics.get('execution_time_seconds', 0.0),
+            backend_info=backend_info
         )
         if html_path:
             assets['solution_report_html'] = html_path
@@ -1037,13 +1181,15 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
             "final_solution_size": metrics.get('final_solution_size', 0),
             "qaoa_depth": qaoa_depth,
             "shots": shots,
-            "backend_type": "iqm_resonance" if iqm_token else "qiskit_simulator"
+            "backend_type": "iqm_resonance" if iqm_token and "IQM" in backend_info else "qiskit_simulator"
         },
+        "backend_used": backend_info,
         "assets": assets
     }
     
     logger.info("=" * 80)
     logger.info("Solver execution completed successfully.")
+    logger.info(f"Backend: {backend_info}")
     logger.info(f"Generated {len(assets)} visualization assets in 'additional_output' directory.")
     logger.info("=" * 80)
     
@@ -1070,13 +1216,24 @@ if __name__ == "__main__":
         ]
     }
     
-    example_params = {
-        "iqm_token": None,  # Use simulator
+    # Example 1: Using Qiskit Simulator (no IQM token)
+    example_params_simulator = {
+        "iqm_token": None,  # Use Qiskit simulator
         "shots": 500,
         "qaoa_depth": 1
     }
     
-    result = run(example_input, example_params, {})
+    # Example 2: Using IQM Resonance (requires valid token)
+    # Uncomment and set your actual token to use IQM hardware
+    # example_params_iqm = {
+    #     "iqm_token": "your_actual_iqm_token_here",
+    #     "quantum_computer": "emerald",
+    #     "shots": 1024,
+    #     "qaoa_depth": 1,
+    #     "use_timeslot": False
+    # }
+    
+    result = run(example_input, example_params_simulator, {})
     
     print("\n" + "=" * 80)
     print("SOLUTION SUMMARY")
