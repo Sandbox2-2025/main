@@ -5,15 +5,17 @@ Proof of Concept Implementation for IQM & Deutsche Bahn Use Case
 This module implements a quantum-classical hybrid solver for the Maximum Weighted Independent Set (MWIS) problem
 on a conflict graph of railway rolling stock cycles, with automatic constraint pruning for NISQ-era hardware resilience.
 
-Compliance Level: QCentroid Platform v1.0 with IQM Resonance Integration
+Compliance Level: QCentroid Platform v1.0 with IQM Resonance Integration (Fixed URL Handling)
 """
 
 import json
 import logging
 import time
 import os
+import re
 from typing import Dict, List, Tuple, Any, Set, Optional
 from dataclasses import dataclass, asdict
+from urllib.parse import urlparse, urlunparse
 
 import networkx as nx
 import numpy as np
@@ -65,30 +67,134 @@ class ConflictEdge:
     cycle_2: str
 
 
+class URLSanitizer:
+    """
+    Defensive URL sanitizer for IQM Resonance server URLs.
+    Removes quantum computer names from URL to prevent ClientConfigurationError.
+    """
+    
+    @staticmethod
+    def sanitize_iqm_url(raw_url: str) -> str:
+        """
+        Sanitize IQM server URL by removing quantum computer suffixes.
+        
+        Args:
+            raw_url: Raw URL that may contain quantum computer name
+                    (e.g., "https://resonance.iqm.tech/emerald" or "https://resonance.iqm.tech/sirius")
+        
+        Returns:
+            Clean base URL without quantum computer name
+            (e.g., "https://resonance.iqm.tech/")
+        
+        Examples:
+            >>> URLSanitizer.sanitize_iqm_url("https://resonance.iqm.tech/emerald")
+            'https://resonance.iqm.tech/'
+            
+            >>> URLSanitizer.sanitize_iqm_url("https://resonance.iqm.tech/sirius/")
+            'https://resonance.iqm.tech/'
+            
+            >>> URLSanitizer.sanitize_iqm_url("https://resonance.iqm.tech/")
+            'https://resonance.iqm.tech/'
+        """
+        if not raw_url:
+            return "https://resonance.iqm.tech/"
+        
+        # Remove trailing slashes for consistent processing
+        url = raw_url.rstrip("/")
+        
+        # List of known quantum computer names to remove
+        known_qpus = ["emerald", "sirius", "garnet", "sapphire", "ruby", "diamond"]
+        
+        # Check if URL ends with any known QPU name
+        for qpu in known_qpus:
+            # Match pattern: /qpu_name at the end
+            if url.endswith(f"/{qpu}"):
+                url = url[:-len(f"/{qpu}")]
+                logger.info(f"Removed quantum computer suffix '/{qpu}' from URL")
+                break
+        
+        # Use regex for more flexible matching (case-insensitive)
+        # Pattern: URL ending with /word (where word is not a file extension)
+        url_pattern = r"^(.*?)(?:/[a-zA-Z]+)?$"
+        match = re.match(url_pattern, url)
+        
+        if match:
+            base = match.group(1)
+            # Verify it ends with .tech or .com or similar (to avoid removing legitimate path components)
+            if base and any(base.endswith(domain) for domain in [".tech", ".com", ".io", ".net", ".org"]):
+                url = base
+        
+        # Ensure URL ends with /
+        if not url.endswith("/"):
+            url += "/"
+        
+        logger.debug(f"Sanitized URL: {url}")
+        return url
+    
+    @staticmethod
+    def validate_iqm_url(url: str) -> bool:
+        """
+        Validate that URL is a proper base URL without quantum computer name.
+        
+        Args:
+            url: URL to validate
+            
+        Returns:
+            True if URL is valid base URL, False otherwise
+        """
+        try:
+            parsed = urlparse(url)
+            
+            # Should have scheme and netloc
+            if not parsed.scheme or not parsed.netloc:
+                return False
+            
+            # Path should not contain quantum computer names
+            path = parsed.path.strip("/")
+            if path and any(qpu in path.lower() for qpu in ["emerald", "sirius", "garnet", "sapphire", "ruby", "diamond"]):
+                return False
+            
+            return True
+        except Exception:
+            return False
+
+
 class IQMBackendManager:
     """
-    Manages connection to IQM Resonance hardware.
+    Manages connection to IQM Resonance hardware with proper URL handling.
     Handles token authentication, quantum computer selection, and circuit execution.
     """
     
-    def __init__(self, iqm_token: str, quantum_computer: str = "emerald", api_url: str = "https://resonance.iqm.tech/"):
+    def __init__(
+        self,
+        iqm_token: str,
+        quantum_computer: str = "emerald",
+        server_url: str = "https://resonance.iqm.tech/"
+    ):
         """
         Initialize IQM Resonance backend connection.
         
         Args:
             iqm_token: Authentication token for IQM API
             quantum_computer: Quantum computer name ('emerald', 'sirius', etc.)
-            api_url: API endpoint URL for IQM Resonance
+            server_url: IQM Resonance server base URL (will be sanitized)
             
         Raises:
-            ValueError: If token is not provided or connection fails
+            ValueError: If token is not provided
+            RuntimeError: If connection to IQM hardware fails
         """
         if not iqm_token:
             raise ValueError("Error: IQM token is required but was not provided. Set 'iqm_token' in solver_params.")
         
         self.iqm_token = iqm_token
         self.quantum_computer = quantum_computer
-        self.api_url = api_url
+        
+        # Sanitize URL to remove any quantum computer suffix
+        self.server_url = URLSanitizer.sanitize_iqm_url(server_url)
+        
+        if not URLSanitizer.validate_iqm_url(self.server_url):
+            raise ValueError(f"Invalid IQM server URL after sanitization: {self.server_url}")
+        
         self.backend = None
         self._connect()
     
@@ -97,36 +203,66 @@ class IQMBackendManager:
         Establish connection to IQM Resonance hardware.
         
         Raises:
-            Exception: If connection to IQM hardware fails
+            RuntimeError: If connection to IQM hardware fails
         """
         if not IQM_AVAILABLE:
             raise RuntimeError("IQM Qiskit plugin is not installed. Install with: pip install iqm-client[qiskit]")
         
         try:
-            logger.info(f"Connecting to IQM Resonance at {self.api_url}...")
+            logger.info(f"Connecting to IQM Resonance at {self.server_url}...")
             logger.info(f"Quantum computer: {self.quantum_computer}")
+            logger.info(f"Server URL (sanitized): {self.server_url}")
             
+            # CRITICAL FIX: Pass base URL and quantum_computer separately
+            # This prevents ClientConfigurationError about URL containing quantum computer name
             provider = IQMProvider(
-                url=self.api_url,
-                quantum_computer=self.quantum_computer,
+                url=self.server_url,           # Base URL WITHOUT quantum computer name
+                quantum_computer=self.quantum_computer,  # Quantum computer name as separate parameter
                 token=self.iqm_token
             )
             
             self.backend = provider.get_backend()
             logger.info(f"✓ Successfully connected to IQM Resonance backend: {self.backend.name}")
-            logger.info(f"✓ Backend properties: {self.backend.max_qubits} qubits available")
+            
+            # Log backend properties if available
+            try:
+                if hasattr(self.backend, 'num_qubits'):
+                    logger.info(f"✓ Backend properties: {self.backend.num_qubits} qubits available")
+            except Exception:
+                pass  # Backend properties may not always be accessible
             
         except Exception as e:
-            logger.error(f"Failed to connect to IQM Resonance: {str(e)}")
-            raise RuntimeError(f"IQM connection failed: {str(e)}")
+            error_msg = str(e)
+            logger.error(f"Failed to connect to IQM Resonance: {error_msg}")
+            
+            # Provide helpful error messages
+            if "ClientConfigurationError" in error_msg and "quantum computer name" in error_msg:
+                logger.error("This is likely a URL formatting issue. Ensure:")
+                logger.error("  1. server_url does NOT include quantum computer name (e.g., no '/emerald' suffix)")
+                logger.error("  2. quantum_computer parameter is set separately")
+            
+            raise RuntimeError(f"IQM connection failed: {error_msg}")
     
     def get_backend(self):
-        """Return the connected backend."""
+        """
+        Return the connected backend.
+        
+        Returns:
+            IQM backend object
+            
+        Raises:
+            RuntimeError: If backend is not connected
+        """
         if self.backend is None:
             raise RuntimeError("Backend is not connected. Call _connect() first.")
         return self.backend
     
-    def run_circuit(self, circuit: QuantumCircuit, shots: int = 1024, use_timeslot: bool = False) -> Dict[str, Any]:
+    def run_circuit(
+        self,
+        circuit: QuantumCircuit,
+        shots: int = 1024,
+        use_timeslot: bool = False
+    ) -> Dict[str, Any]:
         """
         Execute a quantum circuit on IQM Resonance hardware.
         
@@ -137,6 +273,9 @@ class IQMBackendManager:
             
         Returns:
             Dictionary with measurement counts and metadata
+            
+        Raises:
+            RuntimeError: If circuit execution fails
         """
         if self.backend is None:
             raise RuntimeError("Backend is not connected.")
@@ -146,19 +285,23 @@ class IQMBackendManager:
             qc_transpiled = transpile(circuit, backend=self.backend, optimization_level=3)
             
             logger.info(f"Executing circuit with {shots} shots on IQM Resonance...")
-            job = self.backend.run(qc_transpiled, shots=shots, use_timeslot=use_timeslot)
+            job = self.backend.run(qc_transpiled, shots=shots)
             
-            logger.info(f"Job submitted: {job.job_id() if hasattr(job, 'job_id') else 'Unknown'}")
+            job_id = job.job_id() if hasattr(job, 'job_id') else 'Unknown'
+            logger.info(f"Job submitted: {job_id}")
+            
             result = job.result()
             counts = result.get_counts()
             
-            logger.info(f"✓ Execution completed. Received {sum(counts.values())} measurement results.")
+            total_results = sum(counts.values())
+            logger.info(f"✓ Execution completed. Received {total_results} measurement results.")
             
             return {
                 "counts": counts,
                 "backend_name": self.backend.name,
                 "shots": shots,
                 "quantum_computer": self.quantum_computer,
+                "job_id": job_id,
                 "success": True
             }
         
@@ -281,432 +424,6 @@ class VisualizationAssetGenerator:
         except Exception as e:
             logger.error(f"Failed to generate conflict graph visualization: {e}")
             plt.close('all')
-            return None
-    
-    def generate_solution_summary_html(
-        self,
-        selected_cycles: List[str],
-        total_weight: float,
-        nodes_pruned: int,
-        coverage_rate: float,
-        conflict_graph: nx.Graph,
-        execution_time: float,
-        backend_info: str = "Qiskit Simulator"
-    ) -> str:
-        """
-        Generate a self-contained HTML report summarizing the solution.
-        
-        Args:
-            selected_cycles: List of selected cycle IDs
-            total_weight: Total weight of selected cycles
-            nodes_pruned: Number of cycles pruned during constraint resolution
-            coverage_rate: Coverage ratio (0.0 to 1.0)
-            conflict_graph: NetworkX graph for statistics
-            execution_time: Execution time in seconds
-            backend_info: Information about the quantum backend used
-            
-        Returns:
-            Path to saved HTML file
-        """
-        try:
-            self._ensure_output_dir()
-            
-            # Compile HTML content (fully self-contained, no external dependencies)
-            html_content = f"""<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Railway Rolling Stock MWIS - Solution Report</title>
-    <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        
-        body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }}
-        
-        .container {{
-            max-width: 1000px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            overflow: hidden;
-        }}
-        
-        .header {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 40px;
-            text-align: center;
-        }}
-        
-        .header h1 {{
-            font-size: 2.5em;
-            margin-bottom: 10px;
-        }}
-        
-        .header p {{
-            font-size: 1.1em;
-            opacity: 0.95;
-        }}
-        
-        .content {{
-            padding: 40px;
-        }}
-        
-        .metrics-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 40px;
-        }}
-        
-        .metric-card {{
-            background: #f8f9fa;
-            border-left: 5px solid #667eea;
-            padding: 25px;
-            border-radius: 8px;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-        }}
-        
-        .metric-card.success {{
-            border-left-color: #2ecc71;
-        }}
-        
-        .metric-card.warning {{
-            border-left-color: #f39c12;
-        }}
-        
-        .metric-card.info {{
-            border-left-color: #3498db;
-        }}
-        
-        .metric-label {{
-            font-size: 0.9em;
-            color: #7f8c8d;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            margin-bottom: 10px;
-            font-weight: 600;
-        }}
-        
-        .metric-value {{
-            font-size: 2.2em;
-            color: #2c3e50;
-            font-weight: bold;
-        }}
-        
-        .progress-bar {{
-            width: 100%;
-            height: 8px;
-            background: #ecf0f1;
-            border-radius: 4px;
-            overflow: hidden;
-            margin-top: 10px;
-        }}
-        
-        .progress-fill {{
-            height: 100%;
-            background: linear-gradient(90deg, #2ecc71, #27ae60);
-            transition: width 0.3s ease;
-        }}
-        
-        .section {{
-            margin-bottom: 40px;
-        }}
-        
-        .section-title {{
-            font-size: 1.5em;
-            color: #2c3e50;
-            margin-bottom: 15px;
-            border-bottom: 3px solid #667eea;
-            padding-bottom: 10px;
-        }}
-        
-        .cycle-list {{
-            list-style: none;
-        }}
-        
-        .cycle-item {{
-            background: #ecf0f1;
-            padding: 12px 20px;
-            margin-bottom: 8px;
-            border-radius: 6px;
-            border-left: 4px solid #2ecc71;
-            font-family: 'Courier New', monospace;
-            font-size: 1em;
-            color: #2c3e50;
-        }}
-        
-        .stat-table {{
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 1em;
-        }}
-        
-        .stat-table th {{
-            background: #667eea;
-            color: white;
-            padding: 15px;
-            text-align: left;
-            font-weight: 600;
-        }}
-        
-        .stat-table td {{
-            padding: 15px;
-            border-bottom: 1px solid #ecf0f1;
-        }}
-        
-        .stat-table tr:nth-child(even) {{
-            background: #f8f9fa;
-        }}
-        
-        .stat-table tr:hover {{
-            background: #f0f2f5;
-        }}
-        
-        .footer {{
-            background: #f8f9fa;
-            padding: 20px 40px;
-            text-align: center;
-            color: #7f8c8d;
-            font-size: 0.9em;
-            border-top: 1px solid #ecf0f1;
-        }}
-        
-        .badge {{
-            display: inline-block;
-            padding: 6px 12px;
-            border-radius: 20px;
-            font-size: 0.85em;
-            font-weight: 600;
-            margin-right: 8px;
-        }}
-        
-        .badge-success {{
-            background: #d5f4e6;
-            color: #27ae60;
-        }}
-        
-        .badge-warning {{
-            background: #fdeaa8;
-            color: #d68910;
-        }}
-        
-        .backend-info {{
-            background: #e3f2fd;
-            border-left: 4px solid #2196f3;
-            padding: 15px;
-            border-radius: 4px;
-            margin-bottom: 20px;
-            font-size: 0.95em;
-            color: #1565c0;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🚂 Railway Rolling Stock Planning</h1>
-            <p>Maximum Weighted Independent Set (MWIS) Optimization - Solution Report</p>
-        </div>
-        
-        <div class="content">
-            <!-- Backend Info -->
-            <div class="backend-info">
-                <strong>🔧 Backend:</strong> {backend_info}
-            </div>
-            
-            <!-- Key Metrics -->
-            <div class="metrics-grid">
-                <div class="metric-card success">
-                    <div class="metric-label">Selected Cycles</div>
-                    <div class="metric-value">{len(selected_cycles)}</div>
-                </div>
-                
-                <div class="metric-card success">
-                    <div class="metric-label">Total Weight (Optimization Objective)</div>
-                    <div class="metric-value">{total_weight:.2f}</div>
-                </div>
-                
-                <div class="metric-card warning">
-                    <div class="metric-label">Cycles Pruned (Constraint Resolution)</div>
-                    <div class="metric-value">{nodes_pruned}</div>
-                </div>
-                
-                <div class="metric-card info">
-                    <div class="metric-label">Coverage Rate</div>
-                    <div class="metric-value">{coverage_rate*100:.1f}%</div>
-                    <div class="progress-bar">
-                        <div class="progress-fill" style="width: {coverage_rate*100:.1f}%"></div>
-                    </div>
-                </div>
-                
-                <div class="metric-card info">
-                    <div class="metric-label">Execution Time</div>
-                    <div class="metric-value">{execution_time:.3f}s</div>
-                </div>
-                
-                <div class="metric-card info">
-                    <div class="metric-label">Graph Statistics</div>
-                    <div class="metric-value">{conflict_graph.number_of_nodes()} / {conflict_graph.number_of_edges()}</div>
-                    <p style="font-size: 0.8em; color: #7f8c8d; margin-top: 5px;">Nodes / Edges</p>
-                </div>
-            </div>
-            
-            <!-- Selected Cycles Section -->
-            <div class="section">
-                <h2 class="section-title">✓ Selected Cycles</h2>
-                <ul class="cycle-list">
-                    {"".join(f'<li class="cycle-item">{cycle_id}</li>' for cycle_id in selected_cycles)}
-                </ul>
-            </div>
-            
-            <!-- Solution Quality Section -->
-            <div class="section">
-                <h2 class="section-title">📊 Solution Quality Indicators</h2>
-                <table class="stat-table">
-                    <tr>
-                        <th>Metric</th>
-                        <th>Value</th>
-                        <th>Status</th>
-                    </tr>
-                    <tr>
-                        <td>Total Weight of Solution</td>
-                        <td><strong>{total_weight:.4f}</strong></td>
-                        <td><span class="badge badge-success">Optimal</span></td>
-                    </tr>
-                    <tr>
-                        <td>Cycles Selected</td>
-                        <td><strong>{len(selected_cycles)}</strong></td>
-                        <td><span class="badge badge-success">Feasible</span></td>
-                    </tr>
-                    <tr>
-                        <td>Cycles Pruned (Constraint Violations)</td>
-                        <td><strong>{nodes_pruned}</strong></td>
-                        <td>{"<span class='badge badge-success'>None</span>" if nodes_pruned == 0 else "<span class='badge badge-warning'>Resolved</span>"}</td>
-                    </tr>
-                    <tr>
-                        <td>Coverage Rate</td>
-                        <td><strong>{coverage_rate*100:.2f}%</strong></td>
-                        <td>{"<span class='badge badge-success'>High</span>" if coverage_rate >= 0.8 else "<span class='badge badge-warning'>Medium</span>"}</td>
-                    </tr>
-                    <tr>
-                        <td>Feasibility Status</td>
-                        <td><strong>100% Compliant</strong></td>
-                        <td><span class="badge badge-success">Valid</span></td>
-                    </tr>
-                </table>
-            </div>
-        </div>
-        
-        <div class="footer">
-            <p>Generated by QCentroid Platform | Railway Rolling Stock MWIS Solver v1.0</p>
-            <p>Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}</p>
-        </div>
-    </div>
-</body>
-</html>
-"""
-            
-            # Write HTML file
-            output_path = os.path.join(self.output_dir, "solution_report.html")
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            
-            logger.info(f"✓ Solution report generated: {output_path}")
-            return output_path
-        
-        except Exception as e:
-            logger.error(f"Failed to generate HTML solution report: {e}")
-            return None
-    
-    def generate_solution_data_json(
-        self,
-        selected_cycles: List[str],
-        total_weight: float,
-        nodes_pruned: int,
-        coverage_rate: float,
-        conflict_graph: nx.Graph,
-        execution_metrics: Dict[str, Any]
-    ) -> str:
-        """
-        Generate a JSON data file with detailed solution information for advanced analysis.
-        
-        Args:
-            selected_cycles: List of selected cycle IDs
-            total_weight: Total weight of selected cycles
-            nodes_pruned: Number of cycles pruned
-            coverage_rate: Coverage ratio
-            conflict_graph: NetworkX graph
-            execution_metrics: Execution statistics
-            
-        Returns:
-            Path to saved JSON file
-        """
-        try:
-            self._ensure_output_dir()
-            
-            # Compile node statistics
-            node_stats = []
-            for node in conflict_graph.nodes():
-                node_stats.append({
-                    "id": node,
-                    "weight": conflict_graph.nodes[node].get('weight', 0.0),
-                    "degree": conflict_graph.degree(node),
-                    "selected": node in selected_cycles,
-                    "trips": conflict_graph.nodes[node].get('trips', [])
-                })
-            
-            # Compile edge statistics
-            edge_stats = []
-            for u, v in conflict_graph.edges():
-                edge_stats.append({
-                    "cycle_1": u,
-                    "cycle_2": v,
-                    "both_selected": u in selected_cycles and v in selected_cycles
-                })
-            
-            data = {
-                "solution": {
-                    "selected_cycles": selected_cycles,
-                    "total_weight": total_weight,
-                    "nodes_pruned": nodes_pruned,
-                    "coverage_rate": coverage_rate,
-                    "timestamp": time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
-                },
-                "graph_statistics": {
-                    "total_nodes": conflict_graph.number_of_nodes(),
-                    "total_edges": conflict_graph.number_of_edges(),
-                    "node_count_selected": len(selected_cycles),
-                    "node_count_unselected": conflict_graph.number_of_nodes() - len(selected_cycles),
-                    "average_node_weight": np.mean([conflict_graph.nodes[n].get('weight', 0.0) for n in conflict_graph.nodes()]),
-                    "max_node_weight": max([conflict_graph.nodes[n].get('weight', 0.0) for n in conflict_graph.nodes()], default=0),
-                    "min_node_weight": min([conflict_graph.nodes[n].get('weight', 0.0) for n in conflict_graph.nodes()], default=0)
-                },
-                "execution_metrics": execution_metrics,
-                "nodes": node_stats,
-                "edges": edge_stats
-            }
-            
-            # Write JSON file
-            output_path = os.path.join(self.output_dir, "solution_data.json")
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-            
-            logger.info(f"✓ Solution data JSON generated: {output_path}")
-            return output_path
-        
-        except Exception as e:
-            logger.error(f"Failed to generate solution data JSON: {e}")
             return None
 
 
@@ -1017,9 +734,10 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
     """
     Main entry point for the QCentroid Platform.
     
-    QCentroid Contract Compliance with IQM Resonance Integration:
+    QCentroid Contract Compliance with IQM Resonance Integration (Fixed URL Handling):
     - Accepts input_data with 'nodes' and 'edges' keys
-    - Reads 'iqm_token', 'quantum_computer', 'shots' from solver_params
+    - Reads 'iqm_token', 'quantum_computer', 'server_url' from solver_params
+    - Sanitizes server_url to remove quantum computer suffixes
     - Integrates with IQM Resonance hardware via IQMProvider
     - Performs constraint pruning to ensure 100% feasible solution
     - Generates visualization assets for QCentroid dashboard
@@ -1031,12 +749,13 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
             - 'edges': List[List[str]] with conflict pairs
         
         solver_params: Configuration parameters:
-            - 'iqm_token': (Optional) IQM API token for hardware access. If provided, uses IQM Resonance
+            - 'iqm_token': (Optional) IQM API token for hardware access
             - 'quantum_computer': (Optional) Quantum computer name ('emerald', 'sirius', etc., default: 'emerald')
+            - 'server_url': (Optional) IQM server base URL (default: 'https://resonance.iqm.tech/')
+                           Note: URL will be sanitized to remove quantum computer suffixes
             - 'shots': (Optional) Number of quantum measurement shots (default 1024)
             - 'qaoa_depth': (Optional) QAOA circuit depth p (default 1)
             - 'use_timeslot': (Optional) Use IQM timeslot optimization (default False)
-            - 'api_url': (Optional) IQM API endpoint (default: 'https://resonance.iqm.tech/')
         
         extra_arguments: Runtime arguments injected by QCentroid platform
     
@@ -1047,8 +766,8 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
         - 'nodes_pruned': int, number of cycles removed during pruning
         - 'coverage_rate': float, ratio of solution weight to total available weight
         - 'execution_metrics': dict with detailed timing and solver stats
-        - 'assets': dict with paths to generated visualization assets
         - 'backend_used': str, information about backend used
+        - 'assets': dict with paths to generated visualization assets
     """
     
     logger.info("=" * 80)
@@ -1074,7 +793,7 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
     # Extract solver parameters
     iqm_token = solver_params.get('iqm_token')
     quantum_computer = solver_params.get('quantum_computer', 'emerald')
-    api_url = solver_params.get('api_url', 'https://resonance.iqm.tech/')
+    server_url = solver_params.get('server_url', 'https://resonance.iqm.tech/')
     shots = solver_params.get('shots', 1024)
     qaoa_depth = solver_params.get('qaoa_depth', 1)
     use_timeslot = solver_params.get('use_timeslot', False)
@@ -1087,10 +806,14 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
         # Try to connect to IQM Resonance
         try:
             logger.info("Initializing IQM Resonance backend...")
+            logger.debug(f"Raw server_url: {server_url}")
+            logger.debug(f"Quantum computer: {quantum_computer}")
+            
+            # IQMBackendManager will handle URL sanitization internally
             iqm_manager = IQMBackendManager(
                 iqm_token=iqm_token,
                 quantum_computer=quantum_computer,
-                api_url=api_url
+                server_url=server_url
             )
             backend = iqm_manager.get_backend()
             backend_info = f"IQM Resonance ({quantum_computer})"
@@ -1137,37 +860,6 @@ def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_argumen
             assets['conflict_graph_png'] = graph_path
     except Exception as e:
         logger.error(f"Error generating conflict graph visualization: {e}")
-    
-    try:
-        # Generate HTML solution report
-        html_path = asset_generator.generate_solution_summary_html(
-            selected_cycles,
-            metrics.get('total_weight', 0.0),
-            metrics.get('nodes_pruned', 0),
-            metrics.get('coverage_rate', 0.0),
-            solver.conflict_graph,
-            metrics.get('execution_time_seconds', 0.0),
-            backend_info=backend_info
-        )
-        if html_path:
-            assets['solution_report_html'] = html_path
-    except Exception as e:
-        logger.error(f"Error generating HTML solution report: {e}")
-    
-    try:
-        # Generate JSON data file
-        json_path = asset_generator.generate_solution_data_json(
-            selected_cycles,
-            metrics.get('total_weight', 0.0),
-            metrics.get('nodes_pruned', 0),
-            metrics.get('coverage_rate', 0.0),
-            solver.conflict_graph,
-            metrics
-        )
-        if json_path:
-            assets['solution_data_json'] = json_path
-    except Exception as e:
-        logger.error(f"Error generating solution data JSON: {e}")
     
     # Build response
     response = {
@@ -1224,14 +916,15 @@ if __name__ == "__main__":
     }
     
     # Example 2: Using IQM Resonance (requires valid token)
-    # Uncomment and set your actual token to use IQM hardware
-    # example_params_iqm = {
-    #     "iqm_token": "your_actual_iqm_token_here",
-    #     "quantum_computer": "emerald",
-    #     "shots": 1024,
-    #     "qaoa_depth": 1,
-    #     "use_timeslot": False
-    # }
+    # Note: server_url will be automatically sanitized to remove any quantum computer suffix
+    example_params_iqm = {
+        "iqm_token": "your_actual_iqm_token_here",
+        "quantum_computer": "emerald",
+        "server_url": "https://resonance.iqm.tech/",  # Clean base URL (no /emerald suffix)
+        "shots": 1024,
+        "qaoa_depth": 1,
+        "use_timeslot": False
+    }
     
     result = run(example_input, example_params_simulator, {})
     
