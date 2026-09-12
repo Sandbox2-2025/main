@@ -35,6 +35,16 @@ Notes:
 - The conflict penalty P is chosen strictly larger than the largest node
   weight by default, so selecting both endpoints of an edge is never
   beneficial in the classical objective.
+
+Changelog vs. the original PoC:
+- FIX: `nx.is_independent(...)` does not exist in NetworkX's public API and
+  raised AttributeError at runtime. Replaced with a direct, dependency-free
+  independence check equivalent to `QAOAMWISSolver.is_feasible`.
+- FIX: `iqm.qiskit_iqm` now raises RuntimeError (not ImportError) when the
+  obsolete `qiskit-iqm` distribution is installed instead of the current
+  `iqm-client[qiskit]` package. The import fallback below now catches both,
+  so the solver degrades gracefully to AerSimulator / greedy instead of
+  crashing.
 """
 
 import json
@@ -58,11 +68,21 @@ except ImportError:
     SCIPY_AVAILABLE = False
 
 # Quantum imports with fallback
+#
+# NOTE: `qiskit-iqm` is obsolete. The current package is `iqm-client[qiskit]`,
+# but it still exposes the same `iqm.qiskit_iqm` import path. If the obsolete
+# `qiskit-iqm` distribution happens to be installed, importing it raises a
+# RuntimeError (not an ImportError) telling you to migrate. We catch both so
+# this module never crashes on import regardless of which package is present.
+IQM_IMPORT_ERROR: Optional[str] = None
 try:
     from iqm.qiskit_iqm import IQMProvider
     IQM_AVAILABLE = True
 except ImportError:
     IQM_AVAILABLE = False
+except RuntimeError as _iqm_exc:
+    IQM_AVAILABLE = False
+    IQM_IMPORT_ERROR = str(_iqm_exc)
 
 try:
     from qiskit import (
@@ -90,6 +110,15 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
+
+if IQM_IMPORT_ERROR:
+    logger.warning(
+        "El paquete 'qiskit-iqm' instalado está obsoleto y no se pudo importar "
+        "(%s). Instala el sustituto oficial con: "
+        "pip uninstall -y qiskit-iqm && pip install --force-reinstall \"iqm-client[qiskit]\". "
+        "El solver seguirá funcionando con AerSimulator/heurística voraz mientras tanto.",
+        IQM_IMPORT_ERROR,
+    )
 
 
 @dataclass
@@ -171,8 +200,9 @@ class IQMBackendManager:
     def _connect(self):
         if not IQM_AVAILABLE:
             raise RuntimeError(
-                "IQM Qiskit plugin is not installed. "
-                "Install the IQM Qiskit integration available for your environment."
+                "IQM Qiskit plugin is not installed or is obsolete. "
+                "Install the current package with: pip install \"iqm-client[qiskit]\" "
+                "(uninstall the obsolete 'qiskit-iqm' first if present)."
             )
 
         try:
@@ -878,7 +908,14 @@ class RailwayRollingStockSolver:
             "total_empty_km": sum(empty_values) if empty_values else None,
             "total_passenger_km": sum(passenger_values) if passenger_values else None,
             "total_operating_cost": sum(cost_values) if cost_values else None,
-            "is_feasible": nx.is_independent(self.conflict_graph, selected_set),
+            # FIX: `nx.is_independent` does not exist in NetworkX's public API
+            # (AttributeError at runtime in the original PoC). Replaced with a
+            # direct independence check equivalent to
+            # QAOAMWISSolver.is_feasible.
+            "is_feasible": all(
+                not (u in selected_set and v in selected_set)
+                for u, v in self.conflict_graph.edges()
+            ),
         }
 
     def solve(
@@ -1114,64 +1151,78 @@ def run(
 
 
 if __name__ == "__main__":
-    # Local sanity test. No IQM credentials are used here.
+    # Caso de uso: Planificación de Material Rodante (Rolling Stock Planning)
+    # Corredor de 5 ciudades alemanas (Berlín-Hamburgo-Frankfurt-Colonia-Múnich),
+    # modelo simplificado de 5 nodos basado en la red de Deutsche Bahn.
+    #
+    # Grafo de conflictos en anillo: cada ciclo comparte exactamente un trip
+    # con cada uno de sus dos vecinos (C01-C02-C03-C04-C05-C01), por lo que
+    # la solución óptima (MWIS) selecciona nodos alternos no adyacentes.
+    # Solución esperada: C03 + C05 (peso total 179.0).
     example_input = {
         "nodes": [
             {
                 "id": "C01",
-                "weight": 85.0,
+                "weight": 86.0,
                 "trips": ["T01", "T02"],
-                "passenger_km": 8000,
-                "empty_km": 100,
-                "operating_cost": 1200,
-            },
-            {
-                "id": "C02",
-                "weight": 70.0,
-                "trips": ["T02", "T03"],
-                "passenger_km": 7000,
-                "empty_km": 250,
-                "operating_cost": 1250,
-            },
-            {
-                "id": "C03",
-                "weight": 90.0,
-                "trips": ["T04", "T05"],
-                "passenger_km": 9000,
-                "empty_km": 50,
+                "passenger_km": 8200,
+                "empty_km": 80,
                 "operating_cost": 1180,
             },
             {
+                "id": "C02",
+                "weight": 78.0,
+                "trips": ["T02", "T03"],
+                "passenger_km": 7600,
+                "empty_km": 120,
+                "operating_cost": 1210,
+            },
+            {
+                "id": "C03",
+                "weight": 91.0,
+                "trips": ["T03", "T04"],
+                "passenger_km": 9000,
+                "empty_km": 60,
+                "operating_cost": 1160,
+            },
+            {
                 "id": "C04",
-                "weight": 60.0,
-                "trips": ["T01", "T06"],
-                "passenger_km": 6000,
-                "empty_km": 300,
-                "operating_cost": 1300,
+                "weight": 73.0,
+                "trips": ["T04", "T05"],
+                "passenger_km": 7100,
+                "empty_km": 150,
+                "operating_cost": 1240,
             },
             {
                 "id": "C05",
-                "weight": 75.0,
-                "trips": ["T05", "T07"],
-                "passenger_km": 7500,
-                "empty_km": 80,
+                "weight": 88.0,
+                "trips": ["T05", "T01"],
+                "passenger_km": 8500,
+                "empty_km": 70,
                 "operating_cost": 1190,
             },
         ],
         "edges": [
-            ["C01", "C02"],
-            ["C01", "C04"],
-            ["C03", "C05"],
+            ["C01", "C02"],  # Conflicto en T02 (Hamburgo -> Frankfurt)
+            ["C02", "C03"],  # Conflicto en T03 (Frankfurt -> Colonia)
+            ["C03", "C04"],  # Conflicto en T04 (Colonia -> Múnich)
+            ["C04", "C05"],  # Conflicto en T05 (Múnich -> Berlín)
+            ["C05", "C01"],  # Conflicto en T01 (Berlín -> Hamburgo)
         ],
     }
 
     example_params = {
-        "iqm_token": None,
+        "iqm_token": None,             # Simulador local Aer / IQM Resonance
         "quantum_computer": "emerald",
         "server_url": "https://resonance.iqm.tech/",
-        "shots": 512,
-        "qaoa_depth": 1,
+        "shots": 2048,                 # Más shots -> mayor precisión estadística
+        "qaoa_depth": 2,               # Profundidad p de QAOA
+        "penalty": 95.0,               # Ligeramente por encima de max_weight (91.0)
     }
+
+    nodes = example_input["nodes"]
+    edges = example_input["edges"]
+    print(f"{len(nodes)} ciclos candidatos, {len(edges)} conflictos.")
 
     result = run(example_input, example_params, {})
     print(json.dumps(result, indent=2, default=str))
