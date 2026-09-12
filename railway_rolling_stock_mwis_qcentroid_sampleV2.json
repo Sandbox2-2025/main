@@ -1,0 +1,51 @@
+{
+  "nodes": [
+    {
+      "id": "C01",
+      "weight": 86,
+      "trips": ["T01", "T02"],
+      "passenger_km": 8200,
+      "empty_km": 80,
+      "operating_cost": 1180
+    },
+    {
+      "id": "C02",
+      "weight": 78,
+      "trips": ["T02", "T03"],
+      "passenger_km": 7600,
+      "empty_km": 120,
+      "operating_cost": 1210
+    },
+    {
+      "id": "C03",
+      "weight": 91,
+      "trips": ["T03", "T04"],
+      "passenger_km": 9000,
+      "empty_km": 60,
+      "operating_cost": 1160
+    },
+    {
+      "id": "C04",
+      "weight": 73,
+      "trips": ["T04", "T05"],
+      "passenger_km": 7100,
+      "empty_km": 150,
+      "operating_cost": 1240
+    },
+    {
+      "id": "C05",
+      "weight": 88,
+      "trips": ["T05", "T01"],
+      "passenger_km": 8500,
+      "empty_km": 70,
+      "operating_cost": 1190
+    }
+  ],
+  "edges": [
+    ["C01", "C02"],
+    ["C02", "C03"],
+    ["C03", "C04"],
+    ["C04", "C05"],
+    ["C05", "C01"]
+  ]
+}
