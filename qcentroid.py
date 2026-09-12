@@ -1,27 +1,61 @@
 """
-QCentroid Platform Solver: Railway Rolling Stock Cycle Selection via Maximum Weighted Independent Set Optimization
-Proof of Concept Implementation for IQM & Deutsche Bahn Use Case
+qcentroid.py
+Railway Rolling Stock Cycle Selection via Maximum Weighted Independent Set (MWIS)
 
-This module implements a quantum-classical hybrid solver for the Maximum Weighted Independent Set (MWIS) problem
-on a conflict graph of railway rolling stock cycles, with automatic constraint pruning for NISQ-era hardware resilience.
+QCentroid / IQM Proof of Concept
+--------------------------------
+Input:
+{
+  "nodes": [
+    {"id": "C01", "weight": 85.0, "trips": ["T01", "T02"]}
+  ],
+  "edges": [
+    ["C01", "C02"]
+  ]
+}
 
-Compliance Level: QCentroid Platform v1.0 with IQM Resonance Integration (Fixed URL Handling)
+The implementation:
+1. Validates the MWIS graph.
+2. Builds a mathematically consistent MWIS cost Hamiltonian.
+3. Optimizes QAOA parameters on a classical simulator when available.
+4. Executes the optimized circuit on IQM Resonance when a token is supplied.
+5. Selects the most frequent measured bitstring.
+6. Applies deterministic feasibility pruning.
+7. Calculates actual trip coverage, selected weight and empty-km metrics when
+   optional node attributes are supplied.
+8. Produces a conflict-graph PNG asset.
+
+Notes:
+- QAOA parameters are optimized classically; IQM is used for the final circuit
+  execution. This avoids trying to optimize continuous parameters directly on
+  NISQ hardware for this PoC.
+- MWIS is encoded as a minimization problem:
+      H(x) = -sum_i w_i x_i + P sum_(i,j in E) x_i x_j
+  where x_i in {0,1}.
+- The conflict penalty P is chosen strictly larger than the largest node
+  weight by default, so selecting both endpoints of an edge is never
+  beneficial in the classical objective.
 """
 
 import json
 import logging
-import time
+import math
 import os
 import re
-from typing import Dict, List, Tuple, Any, Set, Optional
+import time
 from dataclasses import dataclass, asdict
-from urllib.parse import urlparse, urlunparse
+from typing import Dict, List, Tuple, Any, Set, Optional
 
 import networkx as nx
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import cm
 import matplotlib.patches as mpatches
+
+try:
+    from scipy.optimize import minimize
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
 # Quantum imports with fallback
 try:
@@ -31,904 +65,1113 @@ except ImportError:
     IQM_AVAILABLE = False
 
 try:
-    from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile, execute
+    from qiskit import (
+        QuantumCircuit,
+        QuantumRegister,
+        ClassicalRegister,
+        transpile,
+    )
     from qiskit.circuit import Parameter
-    from qiskit.primitives import Sampler
-    from qiskit_aer import AerSimulator
     QISKIT_AVAILABLE = True
 except ImportError:
     QISKIT_AVAILABLE = False
 
-# Initialize QCentroid logger
+try:
+    from qiskit_aer import AerSimulator
+    AER_AVAILABLE = True
+except ImportError:
+    AER_AVAILABLE = False
+
+
 logger = logging.getLogger("qcentroid-user-log")
 if not logger.handlers:
     handler = logging.StreamHandler()
-    formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+logger.setLevel(logging.INFO)
 
 
 @dataclass
 class CycleNode:
-    """Represents a railway rolling stock cycle candidate."""
+    """Represents a railway rolling-stock cycle candidate."""
     id: str
     weight: float
     trips: Optional[List[str]] = None
-    
-    def to_dict(self) -> Dict:
+    empty_km: Optional[float] = None
+    passenger_km: Optional[float] = None
+    operating_cost: Optional[float] = None
+
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 @dataclass
 class ConflictEdge:
-    """Represents a conflict between two cycles (shared trip)."""
+    """Represents a conflict between two cycles."""
     cycle_1: str
     cycle_2: str
 
 
 class URLSanitizer:
-    """
-    Defensive URL sanitizer for IQM Resonance server URLs.
-    Removes quantum computer names from URL to prevent ClientConfigurationError.
-    """
-    
+    """Sanitize and validate IQM Resonance base URLs."""
+
+    KNOWN_QPUS = {"emerald", "sirius", "garnet", "sapphire", "ruby", "diamond"}
+
     @staticmethod
     def sanitize_iqm_url(raw_url: str) -> str:
-        """
-        Sanitize IQM server URL by removing quantum computer suffixes.
-        
-        Args:
-            raw_url: Raw URL that may contain quantum computer name
-                    (e.g., "https://resonance.iqm.tech/emerald" or "https://resonance.iqm.tech/sirius")
-        
-        Returns:
-            Clean base URL without quantum computer name
-            (e.g., "https://resonance.iqm.tech/")
-        
-        Examples:
-            >>> URLSanitizer.sanitize_iqm_url("https://resonance.iqm.tech/emerald")
-            'https://resonance.iqm.tech/'
-            
-            >>> URLSanitizer.sanitize_iqm_url("https://resonance.iqm.tech/sirius/")
-            'https://resonance.iqm.tech/'
-            
-            >>> URLSanitizer.sanitize_iqm_url("https://resonance.iqm.tech/")
-            'https://resonance.iqm.tech/'
-        """
         if not raw_url:
             return "https://resonance.iqm.tech/"
-        
-        # Remove trailing slashes for consistent processing
+
         url = raw_url.rstrip("/")
-        
-        # List of known quantum computer names to remove
-        known_qpus = ["emerald", "sirius", "garnet", "sapphire", "ruby", "diamond"]
-        
-        # Check if URL ends with any known QPU name
-        for qpu in known_qpus:
-            # Match pattern: /qpu_name at the end
-            if url.endswith(f"/{qpu}"):
-                url = url[:-len(f"/{qpu}")]
-                logger.info(f"Removed quantum computer suffix '/{qpu}' from URL")
-                break
-        
-        # Use regex for more flexible matching (case-insensitive)
-        # Pattern: URL ending with /word (where word is not a file extension)
-        url_pattern = r"^(.*?)(?:/[a-zA-Z]+)?$"
-        match = re.match(url_pattern, url)
-        
-        if match:
-            base = match.group(1)
-            # Verify it ends with .tech or .com or similar (to avoid removing legitimate path components)
-            if base and any(base.endswith(domain) for domain in [".tech", ".com", ".io", ".net", ".org"]):
-                url = base
-        
-        # Ensure URL ends with /
+        parts = url.split("/")
+
+        if parts and parts[-1].lower() in URLSanitizer.KNOWN_QPUS:
+            url = "/".join(parts[:-1])
+
         if not url.endswith("/"):
             url += "/"
-        
-        logger.debug(f"Sanitized URL: {url}")
         return url
-    
+
     @staticmethod
     def validate_iqm_url(url: str) -> bool:
-        """
-        Validate that URL is a proper base URL without quantum computer name.
-        
-        Args:
-            url: URL to validate
-            
-        Returns:
-            True if URL is valid base URL, False otherwise
-        """
         try:
+            from urllib.parse import urlparse
             parsed = urlparse(url)
-            
-            # Should have scheme and netloc
             if not parsed.scheme or not parsed.netloc:
                 return False
-            
-            # Path should not contain quantum computer names
-            path = parsed.path.strip("/")
-            if path and any(qpu in path.lower() for qpu in ["emerald", "sirius", "garnet", "sapphire", "ruby", "diamond"]):
-                return False
-            
-            return True
+            path = parsed.path.strip("/").lower()
+            return not any(qpu in path.split("/") for qpu in URLSanitizer.KNOWN_QPUS)
         except Exception:
             return False
 
 
 class IQMBackendManager:
-    """
-    Manages connection to IQM Resonance hardware with proper URL handling.
-    Handles token authentication, quantum computer selection, and circuit execution.
-    """
-    
+    """Manages IQM Resonance connection and circuit execution."""
+
     def __init__(
         self,
         iqm_token: str,
         quantum_computer: str = "emerald",
-        server_url: str = "https://resonance.iqm.tech/"
+        server_url: str = "https://resonance.iqm.tech/",
     ):
-        """
-        Initialize IQM Resonance backend connection.
-        
-        Args:
-            iqm_token: Authentication token for IQM API
-            quantum_computer: Quantum computer name ('emerald', 'sirius', etc.)
-            server_url: IQM Resonance server base URL (will be sanitized)
-            
-        Raises:
-            ValueError: If token is not provided
-            RuntimeError: If connection to IQM hardware fails
-        """
         if not iqm_token:
-            raise ValueError("Error: IQM token is required but was not provided. Set 'iqm_token' in solver_params.")
-        
+            raise ValueError("IQM token is required.")
+
         self.iqm_token = iqm_token
         self.quantum_computer = quantum_computer
-        
-        # Sanitize URL to remove any quantum computer suffix
         self.server_url = URLSanitizer.sanitize_iqm_url(server_url)
-        
+
         if not URLSanitizer.validate_iqm_url(self.server_url):
-            raise ValueError(f"Invalid IQM server URL after sanitization: {self.server_url}")
-        
+            raise ValueError(f"Invalid IQM base URL: {self.server_url}")
+
         self.backend = None
         self._connect()
-    
+
     def _connect(self):
-        """
-        Establish connection to IQM Resonance hardware.
-        
-        Raises:
-            RuntimeError: If connection to IQM hardware fails
-        """
         if not IQM_AVAILABLE:
-            raise RuntimeError("IQM Qiskit plugin is not installed. Install with: pip install iqm-client[qiskit]")
-        
-        try:
-            logger.info(f"Connecting to IQM Resonance at {self.server_url}...")
-            logger.info(f"Quantum computer: {self.quantum_computer}")
-            logger.info(f"Server URL (sanitized): {self.server_url}")
-            
-            # CRITICAL FIX: Pass base URL and quantum_computer separately
-            # This prevents ClientConfigurationError about URL containing quantum computer name
-            provider = IQMProvider(
-                url=self.server_url,           # Base URL WITHOUT quantum computer name
-                quantum_computer=self.quantum_computer,  # Quantum computer name as separate parameter
-                token=self.iqm_token
+            raise RuntimeError(
+                "IQM Qiskit plugin is not installed. "
+                "Install the IQM Qiskit integration available for your environment."
             )
-            
+
+        try:
+            logger.info("Connecting to IQM Resonance at %s", self.server_url)
+            logger.info("Quantum computer: %s", self.quantum_computer)
+
+            provider = IQMProvider(
+                url=self.server_url,
+                quantum_computer=self.quantum_computer,
+                token=self.iqm_token,
+            )
             self.backend = provider.get_backend()
-            logger.info(f"✓ Successfully connected to IQM Resonance backend: {self.backend.name}")
-            
-            # Log backend properties if available
-            try:
-                if hasattr(self.backend, 'num_qubits'):
-                    logger.info(f"✓ Backend properties: {self.backend.num_qubits} qubits available")
-            except Exception:
-                pass  # Backend properties may not always be accessible
-            
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Failed to connect to IQM Resonance: {error_msg}")
-            
-            # Provide helpful error messages
-            if "ClientConfigurationError" in error_msg and "quantum computer name" in error_msg:
-                logger.error("This is likely a URL formatting issue. Ensure:")
-                logger.error("  1. server_url does NOT include quantum computer name (e.g., no '/emerald' suffix)")
-                logger.error("  2. quantum_computer parameter is set separately")
-            
-            raise RuntimeError(f"IQM connection failed: {error_msg}")
-    
+
+            logger.info("Connected to IQM backend: %s", self.backend.name)
+            if hasattr(self.backend, "num_qubits"):
+                logger.info("Backend qubits: %s", self.backend.num_qubits)
+
+        except Exception as exc:
+            raise RuntimeError(f"IQM connection failed: {exc}") from exc
+
     def get_backend(self):
-        """
-        Return the connected backend.
-        
-        Returns:
-            IQM backend object
-            
-        Raises:
-            RuntimeError: If backend is not connected
-        """
         if self.backend is None:
-            raise RuntimeError("Backend is not connected. Call _connect() first.")
+            raise RuntimeError("IQM backend is not connected.")
         return self.backend
-    
-    def run_circuit(
-        self,
-        circuit: QuantumCircuit,
-        shots: int = 1024,
-        use_timeslot: bool = False
-    ) -> Dict[str, Any]:
-        """
-        Execute a quantum circuit on IQM Resonance hardware.
-        
-        Args:
-            circuit: Qiskit QuantumCircuit to execute
-            shots: Number of measurement shots
-            use_timeslot: Whether to use timeslot optimization
-            
-        Returns:
-            Dictionary with measurement counts and metadata
-            
-        Raises:
-            RuntimeError: If circuit execution fails
-        """
+
+    def run_circuit(self, circuit: QuantumCircuit, shots: int = 1024) -> Dict[str, Any]:
         if self.backend is None:
             raise RuntimeError("Backend is not connected.")
-        
+
         try:
-            logger.info(f"Transpiling circuit for IQM backend ({self.quantum_computer})...")
-            qc_transpiled = transpile(circuit, backend=self.backend, optimization_level=3)
-            
-            logger.info(f"Executing circuit with {shots} shots on IQM Resonance...")
+            qc_transpiled = transpile(
+                circuit,
+                backend=self.backend,
+                optimization_level=3,
+            )
+
+            logger.info(
+                "Executing optimized QAOA circuit on IQM (%s shots)...",
+                shots,
+            )
             job = self.backend.run(qc_transpiled, shots=shots)
-            
-            job_id = job.job_id() if hasattr(job, 'job_id') else 'Unknown'
-            logger.info(f"Job submitted: {job_id}")
-            
+            job_id = job.job_id() if hasattr(job, "job_id") else "Unknown"
+
+            logger.info("IQM job submitted: %s", job_id)
             result = job.result()
             counts = result.get_counts()
-            
-            total_results = sum(counts.values())
-            logger.info(f"✓ Execution completed. Received {total_results} measurement results.")
-            
+
             return {
                 "counts": counts,
                 "backend_name": self.backend.name,
                 "shots": shots,
                 "quantum_computer": self.quantum_computer,
                 "job_id": job_id,
-                "success": True
+                "success": True,
             }
-        
-        except Exception as e:
-            logger.error(f"Circuit execution on IQM failed: {str(e)}")
-            raise RuntimeError(f"IQM execution error: {str(e)}")
+        except Exception as exc:
+            raise RuntimeError(f"IQM execution error: {exc}") from exc
 
 
 class VisualizationAssetGenerator:
-    """
-    Generates visual assets for QCentroid Platform dashboard (Assets tab).
-    Handles PNG rendering, HTML reports, and data summaries.
-    """
-    
+    """Generate conflict graph visualization for QCentroid assets."""
+
     def __init__(self, output_dir: str = "additional_output"):
-        """
-        Initialize the asset generator.
-        
-        Args:
-            output_dir: Directory for saving generated assets
-        """
         self.output_dir = output_dir
-        self._ensure_output_dir()
-    
-    def _ensure_output_dir(self):
-        """Create output directory if it doesn't exist."""
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir, exist_ok=True)
-            logger.info(f"Created output directory: {self.output_dir}")
-    
+        os.makedirs(self.output_dir, exist_ok=True)
+
     def generate_conflict_graph_visualization(
         self,
         conflict_graph: nx.Graph,
         selected_cycles: List[str],
-        pruned_nodes: Set[str]
-    ) -> str:
-        """
-        Render the conflict graph with visual differentiation of selected/pruned nodes.
-        
-        Args:
-            conflict_graph: NetworkX graph of cycle conflicts
-            selected_cycles: List of selected cycle IDs (highlighted in green)
-            pruned_nodes: Set of pruned cycle IDs (highlighted in red)
-            
-        Returns:
-            Path to saved PNG file
-        """
+        pruned_nodes: Set[str],
+    ) -> Optional[str]:
         try:
-            self._ensure_output_dir()
-            
-            fig, ax = plt.subplots(1, 1, figsize=(14, 10))
-            
-            # Compute layout
-            pos = nx.spring_layout(conflict_graph, k=0.5, iterations=50, seed=42)
-            
-            # Determine node colors
+            fig, ax = plt.subplots(figsize=(14, 10))
+            pos = nx.spring_layout(
+                conflict_graph,
+                k=0.5,
+                iterations=50,
+                seed=42,
+            )
+
             selected_set = set(selected_cycles)
             pruned_set = set(pruned_nodes)
             node_colors = []
             node_sizes = []
-            
+
             for node in conflict_graph.nodes():
                 if node in selected_set:
-                    node_colors.append('#2ecc71')  # Green - Selected
-                    node_sizes.append(1000)         # Larger
+                    node_colors.append("#2ecc71")
+                    node_sizes.append(1000)
                 elif node in pruned_set:
-                    node_colors.append('#e74c3c')  # Red - Pruned
-                    node_sizes.append(700)          # Medium
+                    node_colors.append("#e74c3c")
+                    node_sizes.append(700)
                 else:
-                    node_colors.append('#bdc3c7')  # Gray - Not selected
-                    node_sizes.append(700)          # Medium
-            
-            # Draw edges
+                    node_colors.append("#bdc3c7")
+                    node_sizes.append(700)
+
             nx.draw_networkx_edges(
-                conflict_graph, pos, ax=ax,
-                edge_color='#95a5a6', width=1.5, alpha=0.6
+                conflict_graph,
+                pos,
+                ax=ax,
+                edge_color="#95a5a6",
+                width=1.5,
+                alpha=0.6,
             )
-            
-            # Draw nodes with size variation
             nx.draw_networkx_nodes(
-                conflict_graph, pos, ax=ax,
+                conflict_graph,
+                pos,
+                ax=ax,
                 node_color=node_colors,
                 node_size=node_sizes,
-                edgecolors='#2c3e50',
-                linewidths=2.5
+                edgecolors="#2c3e50",
+                linewidths=2.0,
             )
-            
-            # Draw labels with cycle ID and weight
+
             labels = {
                 node: f"{node}\n(w={conflict_graph.nodes[node].get('weight', 0):.2f})"
                 for node in conflict_graph.nodes()
             }
-            nx.draw_networkx_labels(conflict_graph, pos, labels, ax=ax, font_size=9, font_weight='bold')
-            
-            # Create legend
-            green_patch = mpatches.Patch(color='#2ecc71', label='Selected Cycles (MWIS Solution)')
-            red_patch = mpatches.Patch(color='#e74c3c', label='Pruned Cycles (Conflict Removed)')
-            gray_patch = mpatches.Patch(color='#bdc3c7', label='Unselected Cycles')
-            ax.legend(handles=[green_patch, red_patch, gray_patch], loc='upper left', fontsize=11, framealpha=0.95)
-            
-            # Title and labels
-            ax.set_title(
-                'Railway Rolling Stock Conflict Graph\nMaximum Weighted Independent Set (MWIS) Solution',
-                fontsize=15, fontweight='bold', pad=20
+            nx.draw_networkx_labels(
+                conflict_graph,
+                pos,
+                labels,
+                ax=ax,
+                font_size=9,
+                font_weight="bold",
             )
-            ax.text(0.5, -0.05, f'Total Nodes: {conflict_graph.number_of_nodes()} | Total Conflicts: {conflict_graph.number_of_edges()}',
-                    ha='center', transform=ax.transAxes, fontsize=10, style='italic', color='#34495e')
-            
-            ax.axis('off')
+
+            green_patch = mpatches.Patch(
+                color="#2ecc71",
+                label="Selected cycles (MWIS solution)",
+            )
+            red_patch = mpatches.Patch(
+                color="#e74c3c",
+                label="Pruned cycles",
+            )
+            gray_patch = mpatches.Patch(
+                color="#bdc3c7",
+                label="Unselected cycles",
+            )
+            ax.legend(
+                handles=[green_patch, red_patch, gray_patch],
+                loc="upper left",
+                fontsize=11,
+                framealpha=0.95,
+            )
+
+            ax.set_title(
+                "Railway Rolling Stock Conflict Graph\n"
+                "Maximum Weighted Independent Set (MWIS)",
+                fontsize=15,
+                fontweight="bold",
+                pad=20,
+            )
+            ax.text(
+                0.5,
+                -0.05,
+                f"Nodes: {conflict_graph.number_of_nodes()} | "
+                f"Conflicts: {conflict_graph.number_of_edges()}",
+                ha="center",
+                transform=ax.transAxes,
+                fontsize=10,
+                style="italic",
+            )
+            ax.axis("off")
             plt.tight_layout()
-            
-            # Save figure
-            output_path = os.path.join(self.output_dir, "conflict_graph.png")
-            plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
-            logger.info(f"✓ Conflict graph visualization saved to: {output_path}")
+
+            output_path = os.path.join(
+                self.output_dir,
+                "conflict_graph.png",
+            )
+            plt.savefig(
+                output_path,
+                dpi=300,
+                bbox_inches="tight",
+                facecolor="white",
+                edgecolor="none",
+            )
             plt.close(fig)
-            
             return output_path
-        
-        except Exception as e:
-            logger.error(f"Failed to generate conflict graph visualization: {e}")
-            plt.close('all')
+
+        except Exception as exc:
+            logger.error("Visualization failed: %s", exc)
+            plt.close("all")
             return None
 
 
 class MWISPruner:
     """
-    Iterative constraint pruning engine for Maximum Weighted Independent Set solutions.
-    Removes conflicting nodes by greedily eliminating the node with minimum weight in each conflict pair.
+    Deterministic feasibility repair.
+
+    Given a potentially infeasible measured solution, repeatedly removes the
+    lower-weight endpoint of the first internal conflict until the solution
+    becomes independent.
     """
-    
+
     def __init__(self, conflict_graph: nx.Graph):
-        """
-        Initialize the pruner with the conflict graph.
-        
-        Args:
-            conflict_graph: NetworkX graph where edges represent conflicts between cycles
-        """
         self.conflict_graph = conflict_graph.copy()
         self.pruned_nodes: Set[str] = set()
         self.pruning_history: List[Tuple[str, str, float]] = []
-    
+
     def prune(self, selected_cycles: List[str]) -> Tuple[List[str], int]:
-        """
-        Iteratively prune the selected cycles until no conflicts remain.
-        
-        Args:
-            selected_cycles: Initial list of cycle IDs from quantum solution
-            
-        Returns:
-            Tuple of (pruned_cycle_list, number_of_nodes_pruned)
-        """
         current_solution = set(selected_cycles)
-        iteration = 0
-        
+
         while True:
-            iteration += 1
-            # Find all conflicting edges within current solution
-            conflicts = []
-            for edge in self.conflict_graph.edges():
-                node1, node2 = edge
-                if node1 in current_solution and node2 in current_solution:
-                    conflicts.append((node1, node2))
-            
+            conflicts = [
+                (u, v)
+                for u, v in self.conflict_graph.edges()
+                if u in current_solution and v in current_solution
+            ]
+
             if not conflicts:
-                # No conflicts remain; solution is valid
                 break
-            
-            # Select first conflict and remove lower-weight node
+
             node1, node2 = conflicts[0]
-            weight1 = self.conflict_graph.nodes[node1].get('weight', 0.0)
-            weight2 = self.conflict_graph.nodes[node2].get('weight', 0.0)
-            
+            weight1 = float(self.conflict_graph.nodes[node1].get("weight", 0.0))
+            weight2 = float(self.conflict_graph.nodes[node2].get("weight", 0.0))
+
             if weight1 <= weight2:
-                removed_node = node1
+                removed = node1
             else:
-                removed_node = node2
-            
-            current_solution.discard(removed_node)
-            self.pruned_nodes.add(removed_node)
-            self.pruning_history.append((node1, node2, float(max(weight1, weight2))))
-            
-            logger.info(f"Pruning iteration {iteration}: removed cycle '{removed_node}' (weight={min(weight1, weight2):.4f}) due to conflict.")
-        
-        pruned_count = len(self.pruned_nodes)
-        return list(current_solution), pruned_count
-    
+                removed = node2
+
+            current_solution.discard(removed)
+            self.pruned_nodes.add(removed)
+            self.pruning_history.append(
+                (node1, node2, min(weight1, weight2))
+            )
+
+        return sorted(current_solution), len(self.pruned_nodes)
+
     def get_pruning_stats(self) -> Dict[str, Any]:
-        """Return pruning statistics."""
         return {
             "nodes_pruned": len(self.pruned_nodes),
             "pruning_iterations": len(self.pruning_history),
-            "pruned_nodes": list(self.pruned_nodes)
+            "pruned_nodes": sorted(self.pruned_nodes),
         }
 
 
 class QAOAMWISSolver:
     """
-    Quantum Approximate Optimization Algorithm (QAOA) solver for MWIS on railway conflict graphs.
-    Falls back to classical heuristics if quantum hardware is unavailable.
+    QAOA solver for MWIS.
+
+    The objective is:
+        minimize H(x) = -sum(w_i*x_i) + P*sum(x_i*x_j)
+
+    P is deliberately larger than the maximum node weight by default.
     """
-    
-    def __init__(self, conflict_graph: nx.Graph, backend=None, num_qubits: Optional[int] = None):
-        """
-        Initialize QAOA solver.
-        
-        Args:
-            conflict_graph: NetworkX graph representing cycle conflicts
-            backend: Quantum backend (IQM or Qiskit simulator). None for fallback to greedy.
-            num_qubits: Override for number of qubits (useful for subgraph selection)
-        """
+
+    def __init__(
+        self,
+        conflict_graph: nx.Graph,
+        backend=None,
+        num_qubits: Optional[int] = None,
+        penalty: Optional[float] = None,
+    ):
         self.conflict_graph = conflict_graph
         self.backend = backend
-        self.num_nodes = len(conflict_graph.nodes())
+        self.nodes = list(conflict_graph.nodes())
+        self.num_nodes = len(self.nodes)
         self.num_qubits = num_qubits or self.num_nodes
-    
-    def solve_qaoa(self, p: int = 1, shots: int = 1000) -> Dict[str, Any]:
+
+        if self.num_qubits != self.num_nodes:
+            raise ValueError(
+                "This PoC uses one qubit per graph node. "
+                "num_qubits must equal the number of nodes."
+            )
+
+        max_weight = max(
+            (float(conflict_graph.nodes[n].get("weight", 0.0)) for n in self.nodes),
+            default=1.0,
+        )
+        self.penalty = float(penalty) if penalty is not None else 1.25 * max_weight
+
+        if self.penalty <= max_weight:
+            raise ValueError(
+                "Conflict penalty must be strictly greater than the maximum node weight."
+            )
+
+    def classical_objective(self, bits: List[int]) -> float:
+        """Return the MWIS minimization objective for a binary solution."""
+        value = 0.0
+        for i, node in enumerate(self.nodes):
+            if bits[i]:
+                value -= float(self.conflict_graph.nodes[node].get("weight", 0.0))
+
+        for u, v in self.conflict_graph.edges():
+            i = self.nodes.index(u)
+            j = self.nodes.index(v)
+            if bits[i] and bits[j]:
+                value += self.penalty
+
+        return value
+
+    def is_feasible(self, selected: List[str]) -> bool:
+        selected_set = set(selected)
+        return all(
+            not (u in selected_set and v in selected_set)
+            for u, v in self.conflict_graph.edges()
+        )
+
+    def _hamiltonian_coefficients(self):
         """
-        Solve MWIS using QAOA circuit.
-        
-        Args:
-            p: QAOA depth (number of alternating mixer/problem Hamiltonian layers)
-            shots: Number of shots for measurement
-            
-        Returns:
-            Dictionary with solution bitstring and measured counts
+        Expand H(x) using x=(1-Z)/2.
+
+        H = constant + sum_i h_i Z_i + sum_(i,j) J_ij Z_i Z_j
+
+        h_i = w_i/2 - P*degree_i/4
+        J_ij = P/4
         """
+        h = {}
+        for node in self.nodes:
+            weight = float(self.conflict_graph.nodes[node].get("weight", 0.0))
+            degree = self.conflict_graph.degree(node)
+            h[node] = weight / 2.0 - self.penalty * degree / 4.0
+
+        zz = {}
+        for u, v in self.conflict_graph.edges():
+            zz[(u, v)] = self.penalty / 4.0
+
+        return h, zz
+
+    def _build_qaoa_circuit(
+        self,
+        p: int = 1,
+        gamma_values=None,
+        beta_values=None,
+        measure: bool = True,
+    ):
+        if not QISKIT_AVAILABLE:
+            raise RuntimeError("Qiskit is not available.")
+
+        n = len(self.nodes)
+        qr = QuantumRegister(n, "q")
+        cr = ClassicalRegister(n, "c") if measure else None
+
+        qc = QuantumCircuit(qr, cr) if measure else QuantumCircuit(qr)
+
+        h, zz = self._hamiltonian_coefficients()
+
+        if gamma_values is None:
+            gamma_values = [
+                Parameter(f"gamma_{layer}") for layer in range(p)
+            ]
+        if beta_values is None:
+            beta_values = [
+                Parameter(f"beta_{layer}") for layer in range(p)
+            ]
+
+        for i in range(n):
+            qc.h(qr[i])
+
+        for layer in range(p):
+            gamma = gamma_values[layer]
+            beta = beta_values[layer]
+
+            # exp(-i gamma h_i Z_i) -> RZ(2*gamma*h_i)
+            for i, node in enumerate(self.nodes):
+                qc.rz(
+                    2.0 * gamma * h[node],
+                    qr[i],
+                )
+
+            # exp(-i gamma J_ij Z_i Z_j) -> RZZ(2*gamma*J_ij)
+            for (u, v), coupling in zz.items():
+                i = self.nodes.index(u)
+                j = self.nodes.index(v)
+                qc.rzz(
+                    2.0 * gamma * coupling,
+                    qr[i],
+                    qr[j],
+                )
+
+            # Standard X mixer: exp(-i beta X) -> RX(2*beta)
+            for i in range(n):
+                qc.rx(2.0 * beta, qr[i])
+
+        if measure:
+            for i in range(n):
+                qc.measure(qr[i], cr[i])
+
+        return qc
+
+    def _counts_to_solution(self, counts: Dict[str, int]) -> Tuple[List[str], str]:
+        best_bitstring = max(counts, key=counts.get)
+        # Qiskit strings are displayed highest classical bit first.
+        selected = [
+            self.nodes[i]
+            for i in range(len(self.nodes))
+            if best_bitstring[-(i + 1)] == "1"
+        ]
+        return selected, best_bitstring
+
+    def _simulate_counts(self, gamma, beta, p, shots=256):
+        if not (QISKIT_AVAILABLE and AER_AVAILABLE):
+            return None
+
+        qc = self._build_qaoa_circuit(
+            p=p,
+            gamma_values=list(gamma),
+            beta_values=list(beta),
+            measure=True,
+        )
+
+        simulator = AerSimulator()
+        result = simulator.run(qc, shots=shots).result()
+        return result.get_counts()
+
+    def _expected_cost_from_counts(self, counts: Dict[str, int]) -> float:
+        total = sum(counts.values())
+        if total == 0:
+            return float("inf")
+
+        expectation = 0.0
+        for bitstring, count in counts.items():
+            bits = [
+                1 if bitstring[-(i + 1)] == "1" else 0
+                for i in range(len(self.nodes))
+            ]
+            expectation += self.classical_objective(bits) * (count / total)
+
+        return expectation
+
+    def _optimize_parameters(self, p: int, shots: int) -> Tuple[np.ndarray, np.ndarray, float]:
+        """
+        Optimize QAOA parameters on a classical simulator.
+
+        This is intentional for the PoC: the resulting parameters are then
+        sent to IQM for the final hardware execution.
+        """
+        if not (QISKIT_AVAILABLE and AER_AVAILABLE):
+            logger.warning(
+                "Qiskit Aer unavailable; using deterministic fallback parameters."
+            )
+            return (
+                np.full(p, np.pi / 4.0),
+                np.full(p, np.pi / 8.0),
+                float("nan"),
+            )
+
+        rng = np.random.default_rng(42)
+        x0 = np.concatenate([
+            rng.uniform(0.0, 2.0 * np.pi, p),
+            rng.uniform(0.0, np.pi, p),
+        ])
+
+        eval_shots = max(128, min(shots, 512))
+
+        def objective(x):
+            gamma = x[:p]
+            beta = x[p:]
+            counts = self._simulate_counts(
+                gamma,
+                beta,
+                p,
+                shots=eval_shots,
+            )
+            return self._expected_cost_from_counts(counts)
+
+        if SCIPY_AVAILABLE:
+            result = minimize(
+                objective,
+                x0,
+                method="COBYLA",
+                options={"maxiter": max(40, 20 * p)},
+            )
+            x = result.x
+            value = float(result.fun)
+        else:
+            # Lightweight deterministic random search fallback.
+            best_x = x0
+            best_value = objective(x0)
+
+            for _ in range(30):
+                candidate = np.concatenate([
+                    rng.uniform(0.0, 2.0 * np.pi, p),
+                    rng.uniform(0.0, np.pi, p),
+                ])
+                candidate_value = objective(candidate)
+                if candidate_value < best_value:
+                    best_x = candidate
+                    best_value = candidate_value
+
+            x = best_x
+            value = float(best_value)
+
+        return x[:p], x[p:], value
+
+    def solve_qaoa(self, p: int = 1, shots: int = 1024) -> Dict[str, Any]:
         if not QISKIT_AVAILABLE or self.backend is None:
-            logger.warning("Qiskit or backend unavailable; falling back to greedy heuristic.")
+            logger.warning(
+                "Quantum hardware unavailable; using classical greedy fallback."
+            )
             return self.solve_greedy()
-        
+
+        gamma, beta, training_cost = self._optimize_parameters(
+            p=p,
+            shots=shots,
+        )
+
+        logger.info(
+            "Optimized QAOA parameters: gamma=%s beta=%s",
+            np.round(gamma, 5).tolist(),
+            np.round(beta, 5).tolist(),
+        )
+
+        qc = self._build_qaoa_circuit(
+            p=p,
+            gamma_values=gamma,
+            beta_values=beta,
+            measure=True,
+        )
+
         try:
-            nodes_list = list(self.conflict_graph.nodes())
-            n = len(nodes_list)
-            
-            # Build QAOA circuit
-            qc = self._build_qaoa_circuit(nodes_list, p)
-            
-            # Transpile for backend
-            if self.backend:
-                qc_t = transpile(qc, backend=self.backend, optimization_level=3)
+            if isinstance(self.backend, AerSimulator):
+                result = self.backend.run(qc, shots=shots).result()
+                counts = result.get_counts()
+                backend_name = "Qiskit AerSimulator"
+                job_id = "local"
             else:
-                qc_t = qc
-            
-            # Execute
-            job = execute(qc_t, backend=self.backend or AerSimulator(), shots=shots)
-            result = job.result()
-            counts = result.get_counts(qc_t)
-            
-            # Extract best solution
-            best_bitstring = max(counts, key=counts.get)
-            selected = [nodes_list[i] for i in range(n) if best_bitstring[-(i+1)] == '1']
-            
+                qc_t = transpile(
+                    qc,
+                    backend=self.backend,
+                    optimization_level=3,
+                )
+                job = self.backend.run(qc_t, shots=shots)
+                job_id = job.job_id() if hasattr(job, "job_id") else "Unknown"
+                result = job.result()
+                counts = result.get_counts()
+                backend_name = getattr(self.backend, "name", "IQM")
+
+            selected, best_bitstring = self._counts_to_solution(counts)
+
             return {
                 "solution": selected,
                 "counts": counts,
-                "best_bitstring": best_bitstring
+                "best_bitstring": best_bitstring,
+                "algorithm": "QAOA",
+                "qaoa_depth": p,
+                "gamma": gamma.tolist(),
+                "beta": beta.tolist(),
+                "training_cost": training_cost,
+                "backend_name": backend_name,
+                "job_id": job_id,
             }
-        
-        except Exception as e:
-            logger.error(f"QAOA execution failed: {e}. Falling back to greedy heuristic.")
+
+        except Exception as exc:
+            logger.error(
+                "QAOA execution failed: %s. Falling back to greedy.",
+                exc,
+            )
             return self.solve_greedy()
-    
-    def _build_qaoa_circuit(self, nodes: List[str], p: int = 1) -> QuantumCircuit:
-        """
-        Build QAOA circuit for MWIS.
-        
-        The problem Hamiltonian encodes cycle weights on Z terms,
-        and penalties for conflicting cycles (edges).
-        """
-        n = len(nodes)
-        qr = QuantumRegister(n, 'q')
-        cr = ClassicalRegister(n, 'c')
-        qc = QuantumCircuit(qr, cr)
-        
-        # Initial superposition
-        for i in range(n):
-            qc.h(qr[i])
-        
-        # QAOA layers
-        for layer in range(p):
-            # Problem Hamiltonian (apply ZZ gates for edges, Z gates for weights)
-            gamma = Parameter(f'gamma_{layer}')
-            for i, node in enumerate(nodes):
-                weight = self.conflict_graph.nodes[node].get('weight', 0.0)
-                qc.rz(2 * gamma * weight, qr[i])
-            
-            for edge in self.conflict_graph.edges():
-                u, v = edge
-                if u in nodes and v in nodes:
-                    i, j = nodes.index(u), nodes.index(v)
-                    # Penalty for selecting both conflicting nodes
-                    qc.rzz(2 * gamma, qr[i], qr[j])
-            
-            # Mixer Hamiltonian
-            beta = Parameter(f'beta_{layer}')
-            for i in range(n):
-                qc.rx(2 * beta, qr[i])
-        
-        # Measurement
-        for i in range(n):
-            qc.measure(qr[i], cr[i])
-        
-        return qc
-    
+
     def solve_greedy(self) -> Dict[str, Any]:
-        """
-        Greedy heuristic for MWIS: iteratively select maximum-weight nodes
-        that don't conflict with already selected nodes.
-        """
         selected = []
         remaining = set(self.conflict_graph.nodes())
-        
+
         while remaining:
-            # Select node with highest weight
-            best_node = max(remaining, key=lambda n: self.conflict_graph.nodes[n].get('weight', 0.0))
+            best_node = max(
+                remaining,
+                key=lambda n: self.conflict_graph.nodes[n].get("weight", 0.0),
+            )
             selected.append(best_node)
-            
-            # Remove neighbors (conflicting nodes)
-            neighbors = set(self.conflict_graph.neighbors(best_node))
-            remaining -= neighbors
+            remaining -= set(self.conflict_graph.neighbors(best_node))
             remaining.discard(best_node)
-        
+
         return {
             "solution": selected,
             "algorithm": "greedy",
-            "is_feasible": True
+            "is_feasible": True,
         }
 
 
 class RailwayRollingStockSolver:
-    """
-    Main solver orchestrator for the Railway Rolling Stock Cycle Selection problem.
-    Integrates graph construction, quantum solving, constraint pruning, and visualization.
-    """
-    
-    def __init__(self, nodes: List[Dict], edges: List[List[str]]):
-        """
-        Initialize the solver.
-        
-        Args:
-            nodes: List of node dictionaries with 'id', 'weight', and optional 'trips'
-            edges: List of edge pairs [id1, id2] representing conflicts
-        """
+    """Main QCentroid solver orchestrator."""
+
+    def __init__(
+        self,
+        nodes: List[Dict],
+        edges: List[List[str]],
+        penalty: Optional[float] = None,
+    ):
         self.nodes = nodes
         self.edges = edges
+        self.penalty_override = penalty
+        self._validate_input()
         self.conflict_graph = self._build_conflict_graph()
-        self.execution_log = {}
-    
-    def _build_conflict_graph(self) -> nx.Graph:
-        """
-        Construct the conflict graph from nodes and edges.
-        
-        Returns:
-            NetworkX Graph with node weights and edge attributes
-        """
-        G = nx.Graph()
-        
-        # Add nodes with weights
+        self.execution_log: Dict[str, Any] = {}
+
+    def _validate_input(self):
+        if not isinstance(self.nodes, list) or not self.nodes:
+            raise ValueError("Input must contain a non-empty 'nodes' list.")
+        if not isinstance(self.edges, list):
+            raise ValueError("Input must contain an 'edges' list.")
+
+        ids = []
         for node in self.nodes:
-            node_id = node.get('id')
-            weight = node.get('weight', 0.0)
-            trips = node.get('trips', [])
-            G.add_node(node_id, weight=weight, trips=trips)
-        
-        # Add edges (conflicts)
+            if not isinstance(node, dict):
+                raise ValueError("Every node must be a JSON object.")
+
+            node_id = node.get("id")
+            if not isinstance(node_id, str) or not node_id:
+                raise ValueError("Every node requires a non-empty string 'id'.")
+
+            weight = node.get("weight")
+            if not isinstance(weight, (int, float)) or not math.isfinite(float(weight)):
+                raise ValueError(f"Invalid weight for node {node_id}.")
+            if float(weight) <= 0:
+                raise ValueError(f"Weight must be positive for node {node_id}.")
+
+            trips = node.get("trips", [])
+            if trips is not None and not isinstance(trips, list):
+                raise ValueError(f"'trips' must be a list for node {node_id}.")
+
+            if node_id in ids:
+                raise ValueError(f"Duplicate node ID: {node_id}")
+            ids.append(node_id)
+
+        valid_ids = set(ids)
+
         for edge in self.edges:
-            if len(edge) == 2:
-                id1, id2 = edge[0], edge[1]
-                if id1 in G.nodes() and id2 in G.nodes():
-                    G.add_edge(id1, id2)
-        
+            if not isinstance(edge, list) or len(edge) != 2:
+                raise ValueError(
+                    "Each edge must be a two-element list: [cycle_1, cycle_2]."
+                )
+            u, v = edge
+            if u not in valid_ids or v not in valid_ids:
+                raise ValueError(
+                    f"Edge references unknown cycle: [{u}, {v}]"
+                )
+            if u == v:
+                raise ValueError(f"Self-conflict is not allowed: {u}")
+
+    def _build_conflict_graph(self) -> nx.Graph:
+        G = nx.Graph()
+
+        for node in self.nodes:
+            G.add_node(
+                node["id"],
+                weight=float(node["weight"]),
+                trips=node.get("trips", []),
+                empty_km=node.get("empty_km"),
+                passenger_km=node.get("passenger_km"),
+                operating_cost=node.get("operating_cost"),
+            )
+
+        for edge in self.edges:
+            G.add_edge(edge[0], edge[1])
+
         return G
-    
-    def solve(self, backend=None, qaoa_p: int = 1, shots: int = 1000) -> Tuple[List[str], Dict[str, Any], Set[str]]:
-        """
-        Execute the complete solving pipeline.
-        
-        Args:
-            backend: Quantum backend for QAOA (None for greedy fallback)
-            qaoa_p: QAOA depth parameter
-            shots: Number of quantum shots
-            
-        Returns:
-            Tuple of (selected_cycle_ids, solver_metrics, pruned_nodes_set)
-        """
+
+    def _calculate_metrics(self, selected_cycles: List[str]) -> Dict[str, Any]:
+        selected_set = set(selected_cycles)
+
+        total_weight = sum(
+            float(self.conflict_graph.nodes[n].get("weight", 0.0))
+            for n in selected_set
+        )
+
+        all_trips = set()
+        covered_trips = set()
+        for node in self.nodes:
+            all_trips.update(node.get("trips", []) or [])
+
+        for node_id in selected_set:
+            covered_trips.update(
+                self.conflict_graph.nodes[node_id].get("trips", []) or []
+            )
+
+        coverage_rate = (
+            len(covered_trips) / len(all_trips)
+            if all_trips
+            else None
+        )
+
+        empty_values = [
+            self.conflict_graph.nodes[n].get("empty_km")
+            for n in selected_set
+            if self.conflict_graph.nodes[n].get("empty_km") is not None
+        ]
+
+        passenger_values = [
+            self.conflict_graph.nodes[n].get("passenger_km")
+            for n in selected_set
+            if self.conflict_graph.nodes[n].get("passenger_km") is not None
+        ]
+
+        cost_values = [
+            self.conflict_graph.nodes[n].get("operating_cost")
+            for n in selected_set
+            if self.conflict_graph.nodes[n].get("operating_cost") is not None
+        ]
+
+        return {
+            "selected_cycles": len(selected_set),
+            "total_weight": total_weight,
+            "scheduled_trips": len(all_trips),
+            "covered_trips": len(covered_trips),
+            "coverage_rate": coverage_rate,
+            "coverage_percent": (
+                coverage_rate * 100.0 if coverage_rate is not None else None
+            ),
+            "total_empty_km": sum(empty_values) if empty_values else None,
+            "total_passenger_km": sum(passenger_values) if passenger_values else None,
+            "total_operating_cost": sum(cost_values) if cost_values else None,
+            "is_feasible": nx.is_independent(self.conflict_graph, selected_set),
+        }
+
+    def solve(
+        self,
+        backend=None,
+        qaoa_p: int = 1,
+        shots: int = 1000,
+        penalty: Optional[float] = None,
+    ) -> Tuple[List[str], Dict[str, Any], Set[str]]:
+
         start_time = time.time()
-        
-        logger.info(f"Starting MWIS solver for Railway Rolling Stock Planning.")
-        logger.info(f"Conflict graph: {self.conflict_graph.number_of_nodes()} cycles, {self.conflict_graph.number_of_edges()} conflicts.")
-        
-        # Solve using QAOA
-        solver = QAOAMWISSolver(self.conflict_graph, backend=backend)
-        qaoa_result = solver.solve_qaoa(p=qaoa_p, shots=shots)
+
+        if qaoa_p < 1:
+            raise ValueError("qaoa_depth must be >= 1.")
+        if shots < 1:
+            raise ValueError("shots must be >= 1.")
+
+        selected_penalty = (
+            penalty
+            if penalty is not None
+            else self.penalty_override
+        )
+
+        logger.info(
+            "Starting railway rolling-stock MWIS solver: %d cycles, %d conflicts.",
+            self.conflict_graph.number_of_nodes(),
+            self.conflict_graph.number_of_edges(),
+        )
+
+        solver = QAOAMWISSolver(
+            self.conflict_graph,
+            backend=backend,
+            penalty=selected_penalty,
+        )
+
+        qaoa_result = solver.solve_qaoa(
+            p=qaoa_p,
+            shots=shots,
+        )
         initial_solution = qaoa_result.get("solution", [])
-        
-        logger.info(f"Initial quantum solution: {len(initial_solution)} cycles selected.")
-        
-        # Prune invalid configurations
+
+        logger.info(
+            "Initial QAOA/heuristic solution: %d cycles.",
+            len(initial_solution),
+        )
+
         pruner = MWISPruner(self.conflict_graph)
         final_solution, pruned_count = pruner.prune(initial_solution)
-        
-        # Calculate metrics
-        total_weight = sum(self.conflict_graph.nodes[node_id].get('weight', 0.0) for node_id in final_solution)
-        coverage_rate = total_weight / sum(node.get('weight', 0.0) for node in self.nodes) if self.nodes else 0.0
-        
-        execution_time = time.time() - start_time
-        
-        # Log results
-        logger.info(f"Final solution: {len(final_solution)} cycles with total weight {total_weight:.4f}.")
-        logger.info(f"Nodes pruned: {pruned_count}.")
-        logger.info(f"Coverage rate: {coverage_rate:.4f} ({coverage_rate*100:.2f}%).")
-        logger.info(f"Execution time: {execution_time:.4f}s.")
-        
-        self.execution_log = {
-            "execution_time_seconds": execution_time,
+
+        metrics = self._calculate_metrics(final_solution)
+        metrics.update({
+            "execution_time_seconds": time.time() - start_time,
             "initial_solution_size": len(initial_solution),
             "final_solution_size": len(final_solution),
             "nodes_pruned": pruned_count,
-            "total_weight": total_weight,
-            "coverage_rate": coverage_rate,
             "qaoa_algorithm": qaoa_result.get("algorithm", "qaoa"),
-            "pruning_stats": pruner.get_pruning_stats()
+            "qaoa_depth": qaoa_p,
+            "shots": shots,
+            "penalty": solver.penalty,
+            "initial_bitstring": qaoa_result.get("best_bitstring"),
+            "training_cost": qaoa_result.get("training_cost"),
+            "job_id": qaoa_result.get("job_id"),
+        })
+
+        self.execution_log = metrics
+
+        logger.info(
+            "Final solution: %d cycles; total weight %.4f; feasible=%s.",
+            len(final_solution),
+            metrics["total_weight"],
+            metrics["is_feasible"],
+        )
+
+        return final_solution, metrics, pruner.pruned_nodes
+
+
+def run(
+    input_data: Dict[str, Any],
+    solver_params: Dict[str, Any],
+    extra_arguments: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    QCentroid entry point.
+
+    Required input_data:
+      - nodes
+      - edges
+
+    Optional node fields:
+      - trips
+      - empty_km
+      - passenger_km
+      - operating_cost
+
+    solver_params:
+      - iqm_token
+      - quantum_computer
+      - server_url
+      - shots
+      - qaoa_depth
+      - penalty
+    """
+
+    logger.info("=" * 80)
+    logger.info("QCentroid - Railway Rolling Stock MWIS Solver")
+    logger.info("=" * 80)
+
+    try:
+        nodes = input_data.get("nodes", [])
+        edges = input_data.get("edges", [])
+
+        if not nodes:
+            return {
+                "selected_cycles": [],
+                "total_weight": 0.0,
+                "nodes_pruned": 0,
+                "coverage_rate": 0.0,
+                "error": "No input nodes",
+            }
+
+        iqm_token = solver_params.get("iqm_token")
+        quantum_computer = solver_params.get(
+            "quantum_computer",
+            "emerald",
+        )
+        server_url = solver_params.get(
+            "server_url",
+            "https://resonance.iqm.tech/",
+        )
+        shots = int(solver_params.get("shots", 1024))
+        qaoa_depth = int(solver_params.get("qaoa_depth", 1))
+        penalty = solver_params.get("penalty")
+
+        backend = None
+        backend_info = "Classical Greedy Heuristic"
+
+        # Prefer IQM if credentials are supplied.
+        if iqm_token:
+            try:
+                iqm_manager = IQMBackendManager(
+                    iqm_token=iqm_token,
+                    quantum_computer=quantum_computer,
+                    server_url=server_url,
+                )
+                backend = iqm_manager.get_backend()
+                backend_info = f"IQM Resonance ({quantum_computer})"
+            except Exception as exc:
+                logger.warning("IQM connection failed: %s", exc)
+
+        # If IQM is unavailable, use local Aer when possible.
+        if backend is None and QISKIT_AVAILABLE and AER_AVAILABLE:
+            backend = AerSimulator()
+            backend_info = "Qiskit AerSimulator"
+
+        solver = RailwayRollingStockSolver(
+            nodes,
+            edges,
+            penalty=penalty,
+        )
+
+        selected_cycles, metrics, pruned_nodes = solver.solve(
+            backend=backend,
+            qaoa_p=qaoa_depth,
+            shots=shots,
+            penalty=penalty,
+        )
+
+        asset_generator = VisualizationAssetGenerator()
+        assets = {}
+
+        graph_path = asset_generator.generate_conflict_graph_visualization(
+            solver.conflict_graph,
+            selected_cycles,
+            pruned_nodes,
+        )
+
+        if graph_path:
+            assets["conflict_graph_png"] = graph_path
+
+        response = {
+            "selected_cycles": selected_cycles,
+            "total_weight": metrics.get("total_weight", 0.0),
+            "nodes_pruned": metrics.get("nodes_pruned", 0),
+            "coverage_rate": metrics.get("coverage_rate"),
+            "coverage_percent": metrics.get("coverage_percent"),
+            "covered_trips": metrics.get("covered_trips"),
+            "scheduled_trips": metrics.get("scheduled_trips"),
+            "total_empty_km": metrics.get("total_empty_km"),
+            "total_passenger_km": metrics.get("total_passenger_km"),
+            "total_operating_cost": metrics.get("total_operating_cost"),
+            "is_feasible": metrics.get("is_feasible"),
+            "execution_metrics": {
+                "execution_time_seconds": metrics.get(
+                    "execution_time_seconds",
+                    0.0,
+                ),
+                "initial_solution_size": metrics.get(
+                    "initial_solution_size",
+                    0,
+                ),
+                "final_solution_size": metrics.get(
+                    "final_solution_size",
+                    0,
+                ),
+                "qaoa_depth": qaoa_depth,
+                "shots": shots,
+                "penalty": metrics.get("penalty"),
+                "training_cost": metrics.get("training_cost"),
+                "job_id": metrics.get("job_id"),
+            },
+            "backend_used": backend_info,
+            "assets": assets,
+            "pruning_stats": {
+                "nodes_pruned": len(pruned_nodes),
+                "pruned_nodes": sorted(pruned_nodes),
+            },
         }
-        
-        return final_solution, self.execution_log, pruner.pruned_nodes
 
+        logger.info("Solver execution completed successfully.")
+        return response
 
-def run(input_data: Dict[str, Any], solver_params: Dict[str, Any], extra_arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Main entry point for the QCentroid Platform.
-    
-    QCentroid Contract Compliance with IQM Resonance Integration (Fixed URL Handling):
-    - Accepts input_data with 'nodes' and 'edges' keys
-    - Reads 'iqm_token', 'quantum_computer', 'server_url' from solver_params
-    - Sanitizes server_url to remove quantum computer suffixes
-    - Integrates with IQM Resonance hardware via IQMProvider
-    - Performs constraint pruning to ensure 100% feasible solution
-    - Generates visualization assets for QCentroid dashboard
-    - Returns JSON-serializable dictionary with solution and metrics
-    
-    Args:
-        input_data: Dictionary with keys:
-            - 'nodes': List[Dict] with 'id' (str), 'weight' (float), optional 'trips' (List[str])
-            - 'edges': List[List[str]] with conflict pairs
-        
-        solver_params: Configuration parameters:
-            - 'iqm_token': (Optional) IQM API token for hardware access
-            - 'quantum_computer': (Optional) Quantum computer name ('emerald', 'sirius', etc., default: 'emerald')
-            - 'server_url': (Optional) IQM server base URL (default: 'https://resonance.iqm.tech/')
-                           Note: URL will be sanitized to remove quantum computer suffixes
-            - 'shots': (Optional) Number of quantum measurement shots (default 1024)
-            - 'qaoa_depth': (Optional) QAOA circuit depth p (default 1)
-            - 'use_timeslot': (Optional) Use IQM timeslot optimization (default False)
-        
-        extra_arguments: Runtime arguments injected by QCentroid platform
-    
-    Returns:
-        Dictionary with keys:
-        - 'selected_cycles': List[str] of cycle IDs in final solution
-        - 'total_weight': float, sum of weights of selected cycles
-        - 'nodes_pruned': int, number of cycles removed during pruning
-        - 'coverage_rate': float, ratio of solution weight to total available weight
-        - 'execution_metrics': dict with detailed timing and solver stats
-        - 'backend_used': str, information about backend used
-        - 'assets': dict with paths to generated visualization assets
-    """
-    
-    logger.info("=" * 80)
-    logger.info("QCentroid Platform - Railway Rolling Stock MWIS Solver")
-    logger.info("=" * 80)
-    
-    # Extract and validate input data
-    nodes = input_data.get('nodes', [])
-    edges = input_data.get('edges', [])
-    
-    if not nodes:
-        logger.error("No nodes provided in input_data.")
+    except Exception as exc:
+        logger.exception("Solver execution failed.")
         return {
             "selected_cycles": [],
             "total_weight": 0.0,
             "nodes_pruned": 0,
-            "coverage_rate": 0.0,
-            "error": "No input nodes"
+            "coverage_rate": None,
+            "is_feasible": False,
+            "backend_used": "ERROR",
+            "error": str(exc),
         }
-    
-    logger.info(f"Input: {len(nodes)} cycles, {len(edges)} conflict constraints")
-    
-    # Extract solver parameters
-    iqm_token = solver_params.get('iqm_token')
-    quantum_computer = solver_params.get('quantum_computer', 'emerald')
-    server_url = solver_params.get('server_url', 'https://resonance.iqm.tech/')
-    shots = solver_params.get('shots', 1024)
-    qaoa_depth = solver_params.get('qaoa_depth', 1)
-    use_timeslot = solver_params.get('use_timeslot', False)
-    
-    # Initialize backend and determine backend type
-    backend = None
-    backend_info = "Qiskit Simulator (Fallback)"
-    
-    if iqm_token:
-        # Try to connect to IQM Resonance
-        try:
-            logger.info("Initializing IQM Resonance backend...")
-            logger.debug(f"Raw server_url: {server_url}")
-            logger.debug(f"Quantum computer: {quantum_computer}")
-            
-            # IQMBackendManager will handle URL sanitization internally
-            iqm_manager = IQMBackendManager(
-                iqm_token=iqm_token,
-                quantum_computer=quantum_computer,
-                server_url=server_url
-            )
-            backend = iqm_manager.get_backend()
-            backend_info = f"IQM Resonance ({quantum_computer})"
-            logger.info(f"✓ Successfully connected to IQM Resonance backend")
-            
-        except Exception as e:
-            logger.warning(f"IQM Resonance connection failed: {e}")
-            logger.info("Falling back to Qiskit Simulator...")
-            if QISKIT_AVAILABLE:
-                backend = AerSimulator()
-                backend_info = "Qiskit AerSimulator (Fallback from IQM Error)"
-            else:
-                logger.warning("Qiskit not available. Using classical greedy solver.")
-                backend_info = "Classical Greedy Heuristic"
-    else:
-        # No IQM token provided, use Qiskit simulator or greedy
-        if QISKIT_AVAILABLE:
-            logger.info("Using Qiskit AerSimulator (no IQM token provided).")
-            backend = AerSimulator()
-            backend_info = "Qiskit AerSimulator"
-        else:
-            logger.warning("Neither IQM nor Qiskit available. Using classical greedy solver.")
-            backend_info = "Classical Greedy Heuristic"
-    
-    # Create solver instance
-    solver = RailwayRollingStockSolver(nodes, edges)
-    
-    # Solve
-    selected_cycles, metrics, pruned_nodes_set = solver.solve(backend=backend, qaoa_p=qaoa_depth, shots=shots)
-    
-    # Generate visualization assets
-    logger.info("Generating visualization assets for QCentroid dashboard...")
-    asset_generator = VisualizationAssetGenerator(output_dir="additional_output")
-    assets = {}
-    
-    try:
-        # Generate conflict graph PNG
-        graph_path = asset_generator.generate_conflict_graph_visualization(
-            solver.conflict_graph,
-            selected_cycles,
-            pruned_nodes_set
-        )
-        if graph_path:
-            assets['conflict_graph_png'] = graph_path
-    except Exception as e:
-        logger.error(f"Error generating conflict graph visualization: {e}")
-    
-    # Build response
-    response = {
-        "selected_cycles": selected_cycles,
-        "total_weight": metrics.get('total_weight', 0.0),
-        "nodes_pruned": metrics.get('nodes_pruned', 0),
-        "coverage_rate": metrics.get('coverage_rate', 0.0),
-        "execution_metrics": {
-            "execution_time_seconds": metrics.get('execution_time_seconds', 0.0),
-            "initial_solution_size": metrics.get('initial_solution_size', 0),
-            "final_solution_size": metrics.get('final_solution_size', 0),
-            "qaoa_depth": qaoa_depth,
-            "shots": shots,
-            "backend_type": "iqm_resonance" if iqm_token and "IQM" in backend_info else "qiskit_simulator"
-        },
-        "backend_used": backend_info,
-        "assets": assets
-    }
-    
-    logger.info("=" * 80)
-    logger.info("Solver execution completed successfully.")
-    logger.info(f"Backend: {backend_info}")
-    logger.info(f"Generated {len(assets)} visualization assets in 'additional_output' directory.")
-    logger.info("=" * 80)
-    
-    return response
 
 
 if __name__ == "__main__":
-    """
-    Example execution for local testing.
-    """
-    # Sample input data: 5 cycles with conflicts
+    # Local sanity test. No IQM credentials are used here.
     example_input = {
         "nodes": [
-            {"id": "cycle_A", "weight": 100.0, "trips": ["trip_1", "trip_2"]},
-            {"id": "cycle_B", "weight": 85.0, "trips": ["trip_2", "trip_3"]},
-            {"id": "cycle_C", "weight": 95.0, "trips": ["trip_4", "trip_5"]},
-            {"id": "cycle_D", "weight": 110.0, "trips": ["trip_1", "trip_6"]},
-            {"id": "cycle_E", "weight": 70.0, "trips": ["trip_7"]},
+            {
+                "id": "C01",
+                "weight": 85.0,
+                "trips": ["T01", "T02"],
+                "passenger_km": 8000,
+                "empty_km": 100,
+                "operating_cost": 1200,
+            },
+            {
+                "id": "C02",
+                "weight": 70.0,
+                "trips": ["T02", "T03"],
+                "passenger_km": 7000,
+                "empty_km": 250,
+                "operating_cost": 1250,
+            },
+            {
+                "id": "C03",
+                "weight": 90.0,
+                "trips": ["T04", "T05"],
+                "passenger_km": 9000,
+                "empty_km": 50,
+                "operating_cost": 1180,
+            },
+            {
+                "id": "C04",
+                "weight": 60.0,
+                "trips": ["T01", "T06"],
+                "passenger_km": 6000,
+                "empty_km": 300,
+                "operating_cost": 1300,
+            },
+            {
+                "id": "C05",
+                "weight": 75.0,
+                "trips": ["T05", "T07"],
+                "passenger_km": 7500,
+                "empty_km": 80,
+                "operating_cost": 1190,
+            },
         ],
         "edges": [
-            ["cycle_A", "cycle_B"],  # Conflict: share trip_2
-            ["cycle_A", "cycle_D"],  # Conflict: share trip_1
-            ["cycle_B", "cycle_C"],  # Conflict: indirect via system constraints
-        ]
+            ["C01", "C02"],
+            ["C01", "C04"],
+            ["C03", "C05"],
+        ],
     }
-    
-    # Example 1: Using Qiskit Simulator (no IQM token)
-    example_params_simulator = {
-        "iqm_token": None,  # Use Qiskit simulator
-        "shots": 500,
-        "qaoa_depth": 1
-    }
-    
-    # Example 2: Using IQM Resonance (requires valid token)
-    # Note: server_url will be automatically sanitized to remove any quantum computer suffix
-    example_params_iqm = {
-        "iqm_token": "your_actual_iqm_token_here",
+
+    example_params = {
+        "iqm_token": None,
         "quantum_computer": "emerald",
-        "server_url": "https://resonance.iqm.tech/",  # Clean base URL (no /emerald suffix)
-        "shots": 1024,
+        "server_url": "https://resonance.iqm.tech/",
+        "shots": 512,
         "qaoa_depth": 1,
-        "use_timeslot": False
     }
-    
-    result = run(example_input, example_params_simulator, {})
-    
-    print("\n" + "=" * 80)
-    print("SOLUTION SUMMARY")
-    print("=" * 80)
+
+    result = run(example_input, example_params, {})
     print(json.dumps(result, indent=2, default=str))
