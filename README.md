@@ -1,453 +1,671 @@
-# Railway Rolling Stock Cycle Selection via Maximum Weighted Independent Set Optimization
+# QCentroid: Railway Rolling Stock Cycle Selection via MWIS
 
-## Descripción General
-
-Este repositorio contiene un solver híbrido clásico-cuántico para el problema de **Asignación Óptima de Material Rodante Ferroviario** (*Railway Rolling Stock Planning*), implementado como una Prueba de Concepto (PoC) en la plataforma **QCentroid** basada en investigación colaborativa de **IQM** y **Deutsche Bahn**.
-
-### Problema de Negocio
-
-La planificación eficiente del material rodante ferroviario es crítica para:
-
-- **Minimizar kilómetros en vacío**: Reducir desplazamientos de trenes sin carga entre ciclos operacionales
-- **Garantizar cobertura 100%**: Asegurar que todos los viajes programados sean cubiertos sin solapamientos
-- **Optimizar asignación de recursos**: Seleccionar el conjunto de ciclos de máximo valor operativo que no entren en conflicto
-
-### Formulación Matemática: MWIS (Maximum Weighted Independent Set)
-
-El problema se modela como un **Conjunto Independiente de Peso Máximo** sobre un grafo de conflictos:
-
-- **Nodos** (*V*): Representan ciclos de tren candidatos, cada uno con:
-  - `id`: Identificador único del ciclo
-  - `weight`: Valor operativo (ej. cobertura de viajes, eficiencia de recursos)
-  - `trips`: Lista de viajes cubiertos por el ciclo
-
-- **Aristas** (*E*): Pares de ciclos que entran en conflicto (comparten al menos un viaje)
-
-**Objetivo**: Encontrar un subconjunto *S* ⊆ *V* sin aristas entre sus nodos que maximice:
-
-```
-maximize: Σ w(v) para v ∈ S
-sujeto a: ∀(u,v) ∈ E: u ∈ S ∨ v ∈ S (no ambos)
-```
-
-### Arquitectura: Enfoque Híbrido Clásico-Cuántico
-
-El solver implementa un algoritmo de **"divide y vencerás"** con las siguientes capas:
-
-1. **Capa Cuántica (QAOA)**: Ejecuta el algoritmo de Aproximación Cuántica de Optimización (QAOA) en subgrafos de conflicto sobre el hardware **IQM Resonance**
-2. **Capa Clásica de Poda (*Pruning*)**: Elimina iterativamente conflictos residuales garantizando una solución 100% factible
-3. **Visualización**: Genera gráficas del grafo de conflictos con nodos seleccionados/podados para el dashboard de QCentroid
+**Quantum-Classical Hybrid Solver for Maximum Weighted Independent Set (MWIS) Problems**
 
 ---
 
-## Estructura del Repositorio
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Problem Statement](#problem-statement)
+3. [Architecture](#architecture)
+4. [Repository Structure](#repository-structure)
+5. [Installation](#installation)
+6. [Usage](#usage)
+7. [API Specification](#api-specification)
+8. [Deployment on QCentroid Platform](#deployment-on-qcentroid-platform)
+9. [Execution Examples](#execution-examples)
+10. [Implementation Details](#implementation-details)
+11. [NISQ Hardware Considerations](#nisq-hardware-considerations)
+12. [Contributing](#contributing)
+
+---
+
+## Overview
+
+QCentroid is a **hybrid classical-quantum solver** that optimizes railway rolling stock cycle selection using the **Maximum Weighted Independent Set (MWIS)** problem formulation. 
+
+### Key Features
+
+- **QAOA (Quantum Approximate Optimization Algorithm)** execution on IQM Resonance quantum hardware
+- **Classical parameter optimization** via scipy's COBYLA or deterministic random search
+- **Deterministic feasibility pruning** to guarantee 100% valid solutions even with NISQ noise
+- **Conflict graph visualization** showing selected, pruned, and unselected cycles
+- **Fallback mechanisms**: Greedy heuristic when quantum resources are unavailable
+- **Production-ready**: Comprehensive input validation, error handling, and logging
+
+---
+
+## Problem Statement
+
+### Business Challenge
+
+Efficient railway rolling stock planning requires:
+
+- **Minimize empty kilometers**: Reduce repositioning trips between operational cycles
+- **Guarantee 100% coverage**: Every scheduled trip is covered by exactly one cycle
+- **Maximize operational value**: Select the highest-value cycles without conflicts
+
+### Mathematical Formulation: MWIS
+
+The problem is modeled as a **Maximum Weighted Independent Set** on a conflict graph:
+
+**Given**:
+- A graph *G* = (*V*, *E*) where:
+  - **V** = {cycles with id, weight, and optional trip coverage data}
+  - **E** = {pairs of cycles sharing at least one trip (conflict edges)}
+
+**Objective**:
+```
+maximize: Σ w(v) for v ∈ S
+subject to: For all (u,v) ∈ E: ¬(u ∈ S ∧ v ∈ S)  [no conflicts in S]
+where S ⊆ V is the independent set
+```
+
+### Hamiltonian Encoding
+
+The MWIS is cast as a **minimization problem**:
 
 ```
-.
-├── qcentroid.py                    # Punto de entrada principal (función run)
-├── requirements.txt                # Dependencias de Python
-├── README.md                       # Este archivo
+H(x) = -Σ w_i·x_i + P·Σ x_i·x_j   for (i,j) ∈ E
+
+where:
+  x_i ∈ {0,1}  (selection binary variable)
+  w_i ≥ 0      (node weight)
+  P > max(w_i)  (penalty strictly larger than largest weight)
+```
+
+The penalty ensures that selecting both endpoints of an edge is never beneficial in the classical objective.
+
+---
+
+## Architecture
+
+### Execution Pipeline
+
+```
+Input JSON (nodes + edges)
+    ↓
+[1] Conflict Graph Construction (NetworkX)
+    - Validate input data
+    - Build undirected graph with weighted nodes
+    ↓
+[2] QAOA Solver (Quantum or Classical)
+    - Compute Hamiltonian coefficients (h_i, J_ij)
+    - Optimize QAOA parameters classically (scipy/random search)
+    - Build QAOA circuit with optimized parameters
+    - Execute on IQM Resonance or local AerSimulator
+    - Extract best measured bitstring
+    ↓
+[3] Feasibility Pruning (Deterministic)
+    - While conflicting edges exist in selected solution:
+        * Find first edge (u,v) both selected
+        * Remove lower-weight endpoint
+    - Guarantee independent set property
+    ↓
+[4] Metrics & Visualization
+    - Calculate trip coverage, weight sums, empty-km totals
+    - Generate conflict_graph.png with color-coded nodes
+    ↓
+Output JSON (selected_cycles + metrics + assets)
+```
+
+### Core Components
+
+#### 1. **RailwayRollingStockSolver**
+
+Main orchestrator. Responsibilities:
+- Validate input nodes and edges
+- Build conflict graph (NetworkX)
+- Instantiate QAOA solver
+- Orchestrate pruning phase
+- Compute final metrics
+- Trigger visualization
+
+**Key methods**:
+- `solve(backend, qaoa_p, shots, penalty)` → (selected_cycles, metrics, pruned_nodes)
+- `_build_conflict_graph()` → nx.Graph
+- `_calculate_metrics(selected_cycles)` → Dict[str, Any]
+
+#### 2. **QAOAMWISSolver**
+
+QAOA implementation with fallback logic. Responsibilities:
+- Hamiltonian coefficient computation
+- Parameter optimization (classical)
+- QAOA circuit construction
+- Solution extraction from measurement results
+
+**Key methods**:
+- `solve_qaoa(p, shots)` → Dict[best_bitstring, counts, gamma, beta, ...]
+- `solve_greedy()` → Dict[greedy solution]
+- `_optimize_parameters(p, shots)` → (gamma, beta, training_cost)
+- `_build_qaoa_circuit(p, gamma_values, beta_values, measure=True)` → QuantumCircuit
+- `classical_objective(bits)` → float [MWIS cost]
+
+#### 3. **MWISPruner**
+
+Iterative conflict elimination. Responsibilities:
+- Detect edges with both endpoints selected
+- Remove lower-weight node
+- Track pruning history and statistics
+
+**Key methods**:
+- `prune(selected_cycles)` → (feasible_solution, num_pruned)
+- `get_pruning_stats()` → Dict[pruning_iterations, pruned_nodes]
+
+#### 4. **IQMBackendManager**
+
+Manages IQM Resonance connection and execution. Responsibilities:
+- Authenticate with IQM token
+- Validate server URL and quantum computer selection
+- Transpile and execute circuits on hardware
+
+**Key methods**:
+- `__init__(iqm_token, quantum_computer, server_url)`
+- `get_backend()` → IQM backend object
+- `run_circuit(circuit, shots)` → Dict[counts, job_id, backend_name, ...]
+
+#### 5. **VisualizationAssetGenerator**
+
+Generates conflict graph visualization. Responsibilities:
+- Render NetworkX graph with spring layout
+- Color-code nodes: green (selected), red (pruned), gray (unselected)
+- Export PNG with high DPI
+
+**Key methods**:
+- `generate_conflict_graph_visualization(conflict_graph, selected_cycles, pruned_nodes)` → str [filepath]
+
+#### 6. **URLSanitizer**
+
+Utility for IQM URL validation. Responsibilities:
+- Normalize URLs (trailing slashes, known QPU names)
+- Validate URL structure
+
+---
+
+## Repository Structure
+
+```
+Sandbox2-2025/main/
+├── qcentroid.py                    # Main solver implementation
+├── requirements.txt                # Python dependencies
+├── README.md                       # This file
 └── additional_output/
-    └── conflict_graph.png          # Visualización del grafo (generada en ejecución)
+    └── conflict_graph.png          # Generated visualization (runtime)
 ```
 
-### Descripción de Archivos
+### File Descriptions
 
-| Archivo | Descripción |
-|---------|-------------|
-| **qcentroid.py** | Implementación completa del solver con clases: `RailwayRollingStockSolver`, `QAOAMWISSolver`, `MWISPruner`. Punto de entrada: función `run(input_data, solver_params, extra_arguments)` según contrato QCentroid. |
-| **requirements.txt** | Especificación de dependencias Python: `iqm-client`, `qiskit`, `qiskit-aer`, `networkx`, `matplotlib`. Compatible con `pip install -r requirements.txt`. |
-| **additional_output/** | Carpeta de activos visuales generados automáticamente. Incluye `conflict_graph.png` (grafo con nodos verdes=seleccionados, rojos=podados). |
+| File | Purpose |
+|------|---------|
+| **qcentroid.py** | Complete solver implementation with all classes and entry point `run()` function |
+| **requirements.txt** | Python package dependencies (iqm-client, qiskit, networkx, matplotlib, scipy) |
+| **additional_output/** | Auto-created directory for visualization and asset outputs |
 
 ---
 
-## Parámetros del Solver (`solver_params`)
+## Installation
 
-El solver acepta los siguientes parámetros de configuración a través del diccionario `solver_params`:
+### Prerequisites
 
-### Parámetros Obligatorios
+- Python 3.9 or higher
+- pip package manager
+- (Optional) IQM Resonance credentials for quantum hardware execution
 
-| Parámetro | Tipo | Descripción | Ejemplo |
-|-----------|------|-------------|---------|
-| `iqm_token` | String | Token de autenticación para la API de IQM Resonance. Requerido para ejecutar en QPU real. Si se omite, el solver utiliza el simulador local de Qiskit. | `"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."` |
+### Local Setup
 
-### Parámetros Opcionales
+```bash
+# Clone repository
+git clone https://github.com/Sandbox2-2025/main.git
+cd main
 
-| Parámetro | Tipo | Defecto | Descripción |
-|-----------|------|--------|-------------|
-| `shots` | Integer | `1000` | Número de ejecuciones del circuito cuántico QAOA para mejorar la precisión estadística. |
-| `qaoa_depth` | Integer | `1` | Profundidad del circuito QAOA (parámetro *p*). Valores mayores aumentan capacidad de optimización pero consumen más qubits. |
-| `subgraph_size` | Integer | `None` | Tamaño máximo de subgrafo procesado en cada iteración. Si es `None`, se procesa el grafo completo. |
+# Create virtual environment (recommended)
+python3 -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
-### Ejemplo de Configuración
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### requirements.txt Content
+
+```
+networkx>=2.6
+numpy>=1.21
+matplotlib>=3.4
+qiskit>=0.37.0
+qiskit-aer>=0.10.0
+scipy>=1.7.0
+iqm-client>=14.0
+iqm-qiskit-integration>=0.1.0
+```
+
+---
+
+## Usage
+
+### Basic Example (Local Execution)
 
 ```python
-solver_params = {
-    "iqm_token": "tu_token_iqm_aqui",
-    "shots": 500,
-    "qaoa_depth": 2,
-    "subgraph_size": 15
+from qcentroid import run
+
+# Define input data
+input_data = {
+    "nodes": [
+        {"id": "C01", "weight": 85.0, "trips": ["T01", "T02"], "empty_km": 100},
+        {"id": "C02", "weight": 70.0, "trips": ["T02", "T03"], "empty_km": 250},
+        {"id": "C03", "weight": 90.0, "trips": ["T04", "T05"], "empty_km": 50},
+    ],
+    "edges": [["C01", "C02"], ["C02", "C03"]]
 }
+
+# Configure solver parameters
+solver_params = {
+    "iqm_token": None,  # None → use AerSimulator
+    "quantum_computer": "emerald",
+    "server_url": "https://resonance.iqm.tech/",
+    "shots": 512,
+    "qaoa_depth": 1,
+    "penalty": None  # None → auto-compute as 1.25 * max_weight
+}
+
+# Execute solver
+result = run(input_data, solver_params, {})
+
+# Print results
+import json
+print(json.dumps(result, indent=2, default=str))
 ```
+
+### Execution from Command Line
+
+```bash
+python qcentroid.py
+```
+
+This runs the built-in example with 5 cycles and 3 conflicts, producing:
+- Console logs with execution trace
+- `additional_output/conflict_graph.png` visualization
+- JSON output with selected cycles and metrics
 
 ---
 
-## Especificación de Datos (Contrato JSON)
+## API Specification
 
-### Formato de Entrada (`input_data`)
+### Function Signature
 
-El parámetro `input_data` es un diccionario con la siguiente estructura:
+```python
+def run(
+    input_data: Dict[str, Any],
+    solver_params: Dict[str, Any],
+    extra_arguments: Dict[str, Any],
+) -> Dict[str, Any]
+```
 
+### Input: `input_data`
+
+**Structure**:
 ```json
 {
   "nodes": [
     {
-      "id": "cycle_A",
-      "weight": 100.5,
-      "trips": ["trip_1", "trip_2", "trip_3"]
-    },
-    {
-      "id": "cycle_B",
-      "weight": 87.3,
-      "trips": ["trip_2", "trip_4"]
-    },
-    {
-      "id": "cycle_C",
-      "weight": 95.0,
-      "trips": ["trip_5", "trip_6"]
+      "id": "C01",
+      "weight": 85.0,
+      "trips": ["T01", "T02"],
+      "empty_km": 100.0,
+      "passenger_km": 8000.0,
+      "operating_cost": 1200.0
     }
   ],
   "edges": [
-    ["cycle_A", "cycle_B"],
-    ["cycle_B", "cycle_C"]
+    ["C01", "C02"]
   ]
 }
 ```
 
-**Descripción de campos**:
+**Fields**:
 
-- **`nodes`** (List[Dict]): Lista de ciclos candidatos
-  - `id` (String, requerido): Identificador único del ciclo
-  - `weight` (Float, requerido): Valor operativo del ciclo (ej. cobertura de viajes)
-  - `trips` (List[String], opcional): Viajes cubiertos por el ciclo
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `nodes` | List[Dict] | Yes | List of cycle candidates |
+| `nodes[].id` | String | Yes | Unique cycle identifier |
+| `nodes[].weight` | Float | Yes | Operational weight (must be > 0) |
+| `nodes[].trips` | List[String] | No | Trip IDs covered by cycle |
+| `nodes[].empty_km` | Float | No | Empty repositioning kilometers |
+| `nodes[].passenger_km` | Float | No | Passenger-carrying kilometers |
+| `nodes[].operating_cost` | Float | No | Operating cost for cycle |
+| `edges` | List[List[String]] | Yes | Conflict pairs: `[[cycle_id_1, cycle_id_2], ...]` |
 
-- **`edges`** (List[List[String]]): Lista de pares de IDs que representan conflictos
-  - Cada arista es `[cycle_id_1, cycle_id_2]` indicando que ambos ciclos comparten al menos un viaje
+### Input: `solver_params`
 
-### Formato de Salida (Respuesta)
+| Parameter | Type | Default | Required | Description |
+|-----------|------|---------|----------|-------------|
+| `iqm_token` | String | None | No | IQM Resonance authentication token |
+| `quantum_computer` | String | "emerald" | No | Target QPU: emerald, sirius, garnet, sapphire, ruby, diamond |
+| `server_url` | String | "https://resonance.iqm.tech/" | No | IQM server base URL |
+| `shots` | Integer | 1024 | No | Circuit execution shots |
+| `qaoa_depth` | Integer | 1 | No | QAOA circuit depth (p parameter) |
+| `penalty` | Float | None | No | Conflict penalty (if None: auto-computed as 1.25 × max_weight) |
 
-El solver retorna un diccionario JSON con la siguiente estructura:
+### Output
 
+**Structure**:
 ```json
 {
-  "selected_cycles": ["cycle_A", "cycle_C"],
-  "total_weight": 195.5,
+  "selected_cycles": ["C01", "C03"],
+  "total_weight": 175.0,
   "nodes_pruned": 1,
-  "coverage_rate": 0.8247,
+  "coverage_rate": 0.75,
+  "coverage_percent": 75.0,
+  "covered_trips": 4,
+  "scheduled_trips": 5,
+  "total_empty_km": 150.0,
+  "total_passenger_km": 17000.0,
+  "total_operating_cost": 2380.0,
+  "is_feasible": true,
   "execution_metrics": {
-    "execution_time_seconds": 2.341,
+    "execution_time_seconds": 1.234,
     "initial_solution_size": 3,
     "final_solution_size": 2,
     "qaoa_depth": 1,
-    "shots": 1000,
-    "backend_type": "qiskit_simulator"
+    "shots": 512,
+    "penalty": 106.25,
+    "training_cost": -85.5,
+    "job_id": "iqm-job-12345"
+  },
+  "backend_used": "IQM Resonance (emerald)",
+  "assets": {
+    "conflict_graph_png": "additional_output/conflict_graph.png"
+  },
+  "pruning_stats": {
+    "nodes_pruned": 1,
+    "pruned_nodes": ["C02"]
   }
 }
 ```
 
-**Descripción de campos de salida**:
+**Output Fields**:
 
-| Campo | Tipo | Descripción |
+| Field | Type | Description |
 |-------|------|-------------|
-| `selected_cycles` | List[String] | IDs de los ciclos seleccionados en la solución final (sin conflictos) |
-| `total_weight` | Float | Suma total de pesos de los ciclos seleccionados |
-| `nodes_pruned` | Integer | Cantidad de ciclos eliminados durante la fase de poda para resolver conflictos |
-| `coverage_rate` | Float | Ratio de peso total alcanzado vs. peso máximo disponible (0.0 a 1.0) |
-| `execution_metrics` | Dict | Estadísticas de ejecución (tiempo, cantidad de ciclos iniciales/finales, tipo de backend) |
+| `selected_cycles` | List[String] | IDs of cycles in final solution (no conflicts) |
+| `total_weight` | Float | Sum of weights of selected cycles |
+| `nodes_pruned` | Integer | Count of cycles removed during pruning |
+| `coverage_rate` | Float | Ratio of covered trips to total trips (0.0–1.0, or null) |
+| `coverage_percent` | Float | Coverage as percentage (0–100, or null) |
+| `covered_trips` | Integer | Number of distinct trips covered |
+| `scheduled_trips` | Integer | Total number of scheduled trips |
+| `total_empty_km` | Float | Sum of empty_km for selected cycles (or null) |
+| `total_passenger_km` | Float | Sum of passenger_km for selected cycles (or null) |
+| `total_operating_cost` | Float | Sum of operating_cost for selected cycles (or null) |
+| `is_feasible` | Boolean | True if no conflicting edges exist in solution |
+| `execution_metrics` | Dict | Timing, parameter, and job information |
+| `backend_used` | String | Backend identifier (IQM/AerSimulator/Greedy) |
+| `assets` | Dict | Generated visualization file paths |
+| `pruning_stats` | Dict | Pruning iteration count and node list |
 
 ---
 
-## Instrucciones de Despliegue en QCentroid
+## Deployment on QCentroid Platform
 
-### 1. Configuración del Repositorio en QCentroid
+### Step 1: Repository Connection
 
-#### Paso 1: Generar Deploy Key (Clave SSH)
+1. **Generate Deploy Key** in QCentroid Settings → Repository Access
+2. **Add to GitHub**: Settings → Deploy Keys → Paste public key → Save
+3. **Configure Solver**:
+   - Navigate to Solvers panel
+   - Select "Add New Solver"
+   - Repository URL: `git@github.com:Sandbox2-2025/main.git`
+   - Branch: `main`
+   - Click "Validate & Connect"
 
-En QCentroid Platform, accede a **Settings > Repository Access** y genera una nueva Deploy Key:
+### Step 2: Build & Validation
 
-```bash
-# La plataforma generará un par de claves SSH
-# Copia la clave pública y guarda la clave privada de forma segura
-```
-
-#### Paso 2: Añadir Deploy Key al Repositorio GitHub
-
-En tu repositorio de GitHub (`Sandbox2-2025/main`):
-
-1. Ve a **Settings > Deploy keys**
-2. Click en **Add deploy key**
-3. Pega la clave pública de QCentroid
-4. Activa **Allow write access** (si es necesario para actualizaciones)
-5. Click en **Add key**
-
-#### Paso 3: Conectar Repositorio a QCentroid
-
-En QCentroid Platform:
-
-1. Accede al panel de **Solvers**
-2. Click en **Add New Solver** o **Configure Repository**
-3. Selecciona **Git Repository**
-4. Ingresa la URL SSH del repositorio:
-   ```
-   git@github.com:Sandbox2-2025/main.git
-   ```
-5. Selecciona la rama: `main`
-6. Click en **Validate & Connect**
-
-### 2. Compilación y Build
-
-QCentroid realiza automáticamente el siguiente proceso (*Pull & Build*):
+QCentroid automatically:
 
 ```bash
-# 1. Clona el repositorio
 git clone git@github.com:Sandbox2-2025/main.git
-
-# 2. Instala dependencias
 pip install -r requirements.txt
-
-# 3. Valida la función de entrada
-python -c "from qcentroid import run; print('✓ Solver validated')"
-
-# 4. Compila artefactos (if applicable)
+python -c "from qcentroid import run; print('✓ Solver imported successfully')"
 ```
 
-### 3. Ejecución de Jobs en QCentroid
+### Step 3: Submit Job
 
-#### Crear un Job de Prueba
-
-1. Ve a **Jobs > New Job**
-2. Selecciona el solver: **Railway Rolling Stock MWIS**
-3. Carga un archivo JSON con `input_data`:
+1. Navigate to **Jobs** → **New Job**
+2. Select solver: "Railway Rolling Stock MWIS"
+3. Upload `input_data.json`:
 
 ```json
 {
   "nodes": [
-    {"id": "cycle_1", "weight": 100, "trips": ["t1", "t2"]},
-    {"id": "cycle_2", "weight": 90, "trips": ["t2", "t3"]},
-    {"id": "cycle_3", "weight": 110, "trips": ["t4"]}
+    {"id": "cycle_1", "weight": 100, "trips": ["t1", "t2"], "empty_km": 50},
+    {"id": "cycle_2", "weight": 90, "trips": ["t2", "t3"], "empty_km": 75},
+    {"id": "cycle_3", "weight": 110, "trips": ["t4"], "empty_km": 25}
   ],
   "edges": [["cycle_1", "cycle_2"]]
 }
 ```
 
-4. Configura `solver_params`:
+4. Configure `solver_params.json`:
 
 ```json
 {
-  "iqm_token": "tu_token_iqm",
+  "iqm_token": "your-iqm-token-here",
   "shots": 500,
-  "qaoa_depth": 1
+  "qaoa_depth": 2
 }
 ```
 
-5. Click en **Submit Job**
+5. Click **Submit Job**
 
-#### Monitoreo de Ejecución
+### Step 4: Monitor & Retrieve Results
 
-- **Status**: Visualiza el estado del job (pending, running, completed, failed)
-- **Logs**: Accede a los logs en tiempo real desde el logger `qcentroid-user-log`
-- **Assets**: Descarga visualizaciones generadas en `additional_output/conflict_graph.png`
-- **Results**: Visualiza el JSON de salida con la solución y métricas
-
-### 4. Interpretación de Resultados
-
-Después de que el job se complete:
-
-1. **Revisa `selected_cycles`**: Ciclos seleccionados en la solución óptima
-2. **Verifica `nodes_pruned`**: Cuántos ciclos fueron eliminados por conflictos (NISQ noise)
-3. **Analiza `coverage_rate`**: Porcentaje de peso alcanzado (idealmente > 80%)
-4. **Descarga `conflict_graph.png`**: Visualización del grafo con solución destacada
+- **Status Panel**: Real-time job state (pending → running → completed/failed)
+- **Logs**: Stream from `qcentroid-user-log` logger
+- **Results**: JSON output with `selected_cycles` and metrics
+- **Assets**: Download `conflict_graph.png`
 
 ---
 
-## Instalación Local
+## Execution Examples
 
-Para desarrollo y pruebas locales:
+### Example 1: Simple 3-Cycle Problem (Local)
 
-### Requisitos Previos
-
-- Python ≥ 3.9
-- pip (gestor de paquetes de Python)
-
-### Instalación
-
-```bash
-# 1. Clona el repositorio
-git clone https://github.com/Sandbox2-2025/main.git
-cd main
-
-# 2. Crea un entorno virtual (recomendado)
-python3 -m venv venv
-source venv/bin/activate  # En Windows: venv\Scripts\activate
-
-# 3. Instala dependencias
-pip install -r requirements.txt
+```python
+result = run(
+    input_data={
+        "nodes": [
+            {"id": "A", "weight": 10.0, "trips": ["T1"]},
+            {"id": "B", "weight": 20.0, "trips": ["T1", "T2"]},
+            {"id": "C", "weight": 15.0, "trips": ["T2", "T3"]},
+        ],
+        "edges": [["A", "B"], ["B", "C"]]
+    },
+    solver_params={"shots": 256, "qaoa_depth": 1},
+    extra_arguments={}
+)
+# Expected: Select cycles A and C (weight = 25.0, no conflicts)
 ```
 
-### Ejecución Local
+### Example 2: Large Problem with IQM Hardware
 
-```bash
-# Ejecuta el ejemplo integrado en qcentroid.py
-python qcentroid.py
+```python
+result = run(
+    input_data={...},  # 20+ cycles, complex conflicts
+    solver_params={
+        "iqm_token": os.environ["IQM_TOKEN"],
+        "quantum_computer": "emerald",
+        "shots": 1024,
+        "qaoa_depth": 2,
+        "penalty": 150.0
+    },
+    extra_arguments={}
+)
+# Optimized QAOA parameters: executed on real hardware
+# Deterministic pruning: ensures 100% feasibility
 ```
 
-**Salida esperada**:
+### Example 3: Fallback to Greedy (No Quantum)
 
-```
-================================================================================
-QCentroid Platform - Railway Rolling Stock MWIS Solver
-================================================================================
-[2026-09-11 14:23:45] [INFO] Input: 5 cycles, 3 conflict constraints
-[2026-09-11 14:23:45] [INFO] Using Qiskit AerSimulator (IQM token not provided or IQM unavailable).
-[2026-09-11 14:23:46] [INFO] Starting MWIS solver for Railway Rolling Stock Planning.
-[2026-09-11 14:23:46] [INFO] Conflict graph: 5 cycles, 3 conflicts.
-[2026-09-11 14:23:47] [INFO] Initial quantum solution: 3 cycles selected.
-[2026-09-11 14:23:47] [INFO] Pruning iteration 1: removed cycle 'cycle_B' (weight=0.7500) due to conflict.
-[2026-09-11 14:23:47] [INFO] Final solution: 2 cycles with total weight 205.0000.
-[2026-09-11 14:23:47] [INFO] Nodes pruned: 1.
-[2026-09-11 14:23:47] [INFO] Coverage rate: 0.8205 (82.05%).
-[2026-09-11 14:23:47] [INFO] Execution time: 1.2345s.
-[2026-09-11 14:23:47] [INFO] Conflict graph visualization saved to: additional_output/conflict_graph.png
-================================================================================
-SOLUTION SUMMARY
-================================================================================
-{
-  "selected_cycles": ["cycle_A", "cycle_C", "cycle_E"],
-  "total_weight": 275.0,
-  "nodes_pruned": 2,
-  "coverage_rate": 0.8205,
-  "execution_metrics": { ... }
-}
+```python
+result = run(
+    input_data={...},
+    solver_params={"iqm_token": None},  # Triggers fallback
+    extra_arguments={}
+)
+# Uses Qiskit AerSimulator if available; otherwise pure greedy
 ```
 
 ---
 
-## Arquitectura Técnica Detallada
+## Implementation Details
 
-### Flujo de Ejecución
+### QAOA Parameter Optimization
+
+The solver optimizes QAOA parameters **classically** before executing on hardware:
+
+1. **Initialization**: Random uniform sampling
+   - γ ∈ [0, 2π]
+   - β ∈ [0, π]
+
+2. **Optimization Method**:
+   - **scipy available**: COBYLA (constrained optimization)
+   - **scipy unavailable**: Deterministic random search (30 iterations)
+
+3. **Objective Function**:
+   - Simulate QAOA circuit with candidate parameters
+   - Compute expected MWIS cost from measurement statistics
+   - Minimize expected cost
+
+4. **Evaluation Shots**: max(128, min(shots, 512))
+
+### Hamiltonian Coefficients
+
+From `H(x) = -Σ w_i·x_i + P·Σ x_i·x_j`, using `x = (1 - Z_i)/2`:
 
 ```
-Input JSON (nodes + edges)
-    ↓
-┌─────────────────────────────┐
-│ Construcción del Grafo      │ (NetworkX)
-│ - Add nodes con pesos       │
-│ - Add edges (conflictos)    │
-└─────────────────────────────┘
-    ↓
-┌─────────────────────────────┐
-│ Solver QAOA/Clásico         │
-│ - Backend: IQM o AerSim     │
-│ - Circuito QAOA (depth=p)   │
-│ - Fallback: Greedy heuristic│
-└─────────────────────────────┘
-    ↓
-┌─────────────────────────────┐
-│ Poda Iterativa (Pruning)    │
-│ - Detectar conflictos       │
-│ - Eliminar nodos mín-peso   │
-│ - Repetir hasta factible    │
-└─────────────────────────────┘
-    ↓
-┌─────────────────────────────┐
-│ Visualización + Logging     │
-│ - NetworkX layout           │
-│ - Render conflict_graph.png │
-│ - Log métricas QCentroid    │
-└─────────────────────────────┘
-    ↓
-Output JSON (selected + metrics)
+H = constant + Σ h_i·Z_i + Σ J_ij·Z_i·Z_j
+
+where:
+  h_i = w_i/2 - (P·degree(i))/4
+  J_ij = P/4 (for each edge)
 ```
 
-### Clases Principales
+### QAOA Circuit Layers (p ≥ 1)
 
-#### `RailwayRollingStockSolver`
-Orquestador principal que integra todas las fases de resolución.
+Per layer:
+1. **Problem Hamiltonian**: RZ(2γ·h_i) and RZZ(2γ·J_ij) gates
+2. **Mixer Hamiltonian**: Standard X mixer RX(2β) on all qubits
 
-**Métodos**:
-- `solve(backend, qaoa_p, shots)`: Ejecuta pipeline completo
-- `visualize_conflict_graph(selected_cycles, output_dir)`: Genera PNG del grafo
+### Deterministic Pruning Algorithm
 
-#### `QAOAMWISSolver`
-Implementa QAOA y fallback a heurística greedy.
+```
+Input: selected_cycles (may have conflicts), conflict_graph
+Output: feasible_solution (independent set)
 
-**Métodos**:
-- `solve_qaoa(p, shots)`: Ejecuta circuito QAOA
-- `solve_greedy()`: Resuelve con heurística clásica
+while ∃ edge (u,v) where u,v ∈ selected_cycles:
+    find_conflict(u, v)
+    weight_u ← graph.nodes[u]['weight']
+    weight_v ← graph.nodes[v]['weight']
+    
+    if weight_u ≤ weight_v:
+        remove(u)
+    else:
+        remove(v)
 
-#### `MWISPruner`
-Motor de eliminación iterativa de conflictos.
+return selected_cycles (now conflict-free)
+```
 
-**Métodos**:
-- `prune(selected_cycles)`: Retorna solución factible sin conflictos
-- `get_pruning_stats()`: Estadísticas de poda
+**Key Property**: Iteratively removing minimum-weight endpoints preserves solution quality.
 
----
+### Greedy Fallback
 
-## Consideraciones de Hardware NISQ
+When quantum hardware is unavailable:
 
-El solver está optimizado para infraestructura cuántica **NISQ** (*Noisy Intermediate-Scale Quantum*) del tipo IQM Resonance:
+```python
+selected = []
+remaining = all_nodes
 
-- **Ruido hardware**: Los circuitos QAOA pueden producir soluciones con violaciones de restricciones
-- **Solución**: La capa de **poda iterativa** garantiza 100% factibilidad eliminando conflictos
-- **Profundidad QAOA**: Se recomienda `p ≤ 2` para limitar propagación de errores
+while remaining:
+    best = argmax(weight[n] for n ∈ remaining)
+    selected.append(best)
+    remaining -= neighbors(best)
+    remaining.discard(best)
 
----
-
-## Contribuciones y Contacto
-
-Este solver es parte de la investigación colaborativa entre **IQM** y **Deutsche Bahn**.
-
-Para preguntas o mejoras:
-- Abre un **Issue** en el repositorio de GitHub
-- Crea un **Pull Request** con cambios propuestos
-
----
-
-## Licencia
-
-Este proyecto se distribuye bajo la licencia MIT. Consulta el archivo `LICENSE` (si existe) para más detalles.
+return selected  # Independent set (guaranteed)
+```
 
 ---
 
-## Referencias
+## NISQ Hardware Considerations
 
-[1] QCentroid Platform Documentation - https://qcentroid.io/docs  
-[2] QCentroid User Guide - https://qcentroid.io/user-guide  
-[3] IQM Resonance Hardware - https://www.iqmtechnology.com/resonance  
-[4] Karp, R. M. (1972). "Reducibility Among Combinatorial Problems" - Maximum Independent Set Problem  
-[5] IQM & Deutsche Bahn Collaboration - Railway Rolling Stock Optimization PoC  
-[6] Deutsche Bahn Digital Strategy - Quantum Computing Initiatives  
-[7] Farhi, E., Goldstone, J., & Gutmann, S. (2014). "A Quantum Approximate Optimization Algorithm" (QAOA)  
-[8] Zhou, L., Wang, S. T., Choi, S., Pichler, H., & Lukin, M. D. (2020). "Quantum Approximate Optimization Algorithm: Performance, Mechanism, and Implementation" - Nature Physics  
-[9] Hogg, T. (2000). "Quantum computing and phase transitions in combinatorial search" - Journal of Artificial Intelligence Research  
-[10] European Railways Association - Rolling Stock Management Best Practices  
-[11] International Union of Railways - Operational Efficiency Standards  
-[12] QCentroid Solver API Contract - Function Signature Specification  
-[13] Python Package Index (PyPI) - Dependency Management  
-[14] Matplotlib Documentation - Network Graph Visualization  
-[15] IQM API Authentication - Token Generation & Management  
-[16] Qiskit Documentation - Circuit Execution & Shot Statistics  
-[17] Quantum Error Mitigation - Shot Count Recommendations  
-[18] Graph Partitioning Algorithms - Subgraph Decomposition  
-[19] GitHub Deploy Keys - SSH Key Authentication  
-[20] GitHub API - Repository Access Control  
-[21] QCentroid CI/CD Pipeline - Job Execution & Monitoring  
-[22] QCentroid Asset Management - Output Artifact Storage & Retrieval  
+The solver is **optimized for NISQ devices** (limited qubits, short coherence times, gate errors):
+
+### Challenge: NISQ Noise
+
+- QAOA circuits executed on IQM hardware may produce measurements with conflicting edges
+- Short coherence windows require shallow circuits (p ≤ 2)
+- Gate errors and shot noise introduce variability in measured bitstrings
+
+### Solution: Deterministic Feasibility Layer
+
+1. **Acknowledgment**: NISQ solutions may violate independent set constraints
+2. **Pruning Strategy**: Iteratively remove conflicting nodes
+3. **Guarantee**: Final solution is **100% feasible** (no conflicts)
+4. **Quality Trade-off**: Minimal weight loss since only minimum-weight nodes are removed
+
+### Recommendations
+
+- **qaoa_depth**: p = 1 or 2 (deeper circuits accumulate more errors)
+- **shots**: ≥ 512 for stable statistics (1024 ideal)
+- **penalty**: Leave as default (1.25 × max_weight) unless tuning for specific hardware
 
 ---
 
-**Versión**: 1.0  
-**Última actualización**: 2026-09-11  
-**Plataforma**: QCentroid Platform v1.0  
-**Estado**: Production Ready
+## Contributing
+
+### Reporting Issues
+
+Open a **GitHub Issue** with:
+- Problem description
+- Input data (if shareable)
+- Expected vs. actual output
+- Execution logs (full traceback)
+
+### Submitting Changes
+
+1. Fork repository
+2. Create feature branch: `git checkout -b feature/my-improvement`
+3. Commit with clear messages
+4. Push and open **Pull Request**
+5. Link related issues
+
+### Code Style
+
+- Python 3.9+ type hints
+- Docstrings for all public methods
+- Comprehensive logging (logger = logging.getLogger("qcentroid-user-log"))
+- Unit tests for new features (if applicable)
+
+---
+
+## License
+
+MIT License. See `LICENSE` file for details.
+
+---
+
+## References
+
+1. Farhi, E., Goldstone, J., & Gutmann, S. (2014). "A Quantum Approximate Optimization Algorithm"
+2. IQM Technology - [Resonance Hardware](https://www.iqmtechnology.com/resonance)
+3. Qiskit Documentation - [Circuit Execution](https://qiskit.org/documentation/)
+4. NetworkX - [Graph Algorithms](https://networkx.org/)
+5. Maximum Weighted Independent Set - NP-complete optimization problem
+
+---
+
+**Version**: 2.0  
+**Last Updated**: 2026-09-12  
+**Platform**: QCentroid Platform v1.0 + IQM Resonance  
+**Status**: Production Ready
