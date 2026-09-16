@@ -1,43 +1,7 @@
-"""
-qcentroid.py - Solver Híbrido MWIS + QAOA para QCentroid Quantum Platform
-
-Problema:
-    Selección de ciclos de material rodante ferroviario como
-    Maximum Weighted Independent Set (MWIS).
-
-Formulación:
-    Minimizar:
-        H(x) = -sum(w_i * x_i)
-               + lambda * sum(x_i * x_j)
-
-    donde:
-        x_i = 1 si el ciclo i es seleccionado
-        x_i = 0 si no es seleccionado
-        w_i = peso/valor del ciclo
-        lambda = penalización por conflicto
-
-La función objetivo utiliza explícitamente el campo "weight".
-Los campos passenger_km, empty_km y operating_cost se utilizan
-como métricas operativas de la solución.
-
-Incluye:
-    - Ground Truth exacto mediante Maximum Weight Clique
-      sobre el grafo complementario.
-    - QAOA mediante Qiskit.
-    - Ejecución opcional en IQM Resonance.
-    - Fallback a solución exacta si Qiskit no está disponible.
-    - Reparación/poda determinista de soluciones QAOA.
-    - Métricas operativas.
-    - Generación de grafo PNG.
-
-Punto de entrada oficial:
-    run(input_data, solver_params, extra_arguments)
-"""
-
-import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import logging
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
@@ -45,87 +9,55 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import networkx as nx
 
-
-# ============================================================
-# IMPORTACIONES OPCIONALES
-# ============================================================
-
-QISKIT_AVAILABLE = False
-AER_AVAILABLE = False
-
 try:
-    from qiskit import ClassicalRegister, QuantumCircuit, QuantumRegister, transpile
-    QISKIT_AVAILABLE = True
-
-    try:
-        from qiskit_aer import AerSimulator
-        AER_AVAILABLE = True
-    except ImportError:
-        AER_AVAILABLE = False
-
+    from qiskit import QuantumCircuit
+    from qiskit_aer import AerSimulator
 except ImportError:
-    QISKIT_AVAILABLE = False
-
-
-# Adaptador IQM Resonance
-IQM_AVAILABLE = False
-IQM_IMPORT_ERROR: Optional[str] = None
+    QuantumCircuit = None
+    AerSimulator = None
 
 try:
     from iqm.qiskit_iqm import IQMProvider
-    IQM_AVAILABLE = True
 except ImportError:
-    IQM_AVAILABLE = False
-except RuntimeError as exc:
-    IQM_AVAILABLE = False
-    IQM_IMPORT_ERROR = str(exc)
+    IQMProvider = None
 
 
 # ============================================================
-# LOGGER
+# LOGGING
 # ============================================================
 
-logger = logging.getLogger("qcentroid-user-log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] %(message)s"
-    )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# IQM URL
+# URL SANITIZER
 # ============================================================
 
 class URLSanitizer:
-    """Limpia la URL de IQM para evitar que contenga el nombre de la QPU."""
-
-    KNOWN_QPUS = {
-        "emerald",
-        "sirius",
-        "garnet",
-        "sapphire",
-        "ruby",
-        "diamond",
-    }
+    """
+    Sanitizes backend URLs and prevents accidental exposure of
+    credentials in logs.
+    """
 
     @staticmethod
-    def sanitize_iqm_url(raw_url: str) -> str:
-        if not raw_url:
-            return "https://resonance.iqm.tech/"
+    def sanitize(url):
+        if not url:
+            return url
 
-        url = raw_url.rstrip("/")
-        parts = url.split("/")
-
-        if parts and parts[-1].lower() in URLSanitizer.KNOWN_QPUS:
-            url = "/".join(parts[:-1])
-
-        if not url.endswith("/"):
-            url += "/"
+        for token_name in [
+            "IQM_TOKEN",
+            "IQM_API_TOKEN",
+            "API_TOKEN",
+            "TOKEN"
+        ]:
+            token = os.getenv(token_name)
+            if token and token in url:
+                url = url.replace(token, "***")
 
         return url
 
@@ -136,1292 +68,1174 @@ class URLSanitizer:
 
 class MWISObjective:
     """
-    Define la función objetivo MWIS y su representación QUBO/Ising.
+    Defines the MWIS objective.
 
-    IMPORTANTE:
-        "weight" es el valor que se optimiza.
+    If an explicit 'weight' is supplied for every node, it is used
+    as the optimization objective.
 
-    passenger_km, empty_km y operating_cost NO modifican
-    el objetivo por defecto; se utilizan como métricas
-    operativas de la solución.
+    Otherwise, a fallback objective is calculated as:
+
+        2 * passenger_km - empty_km
     """
 
-    def __init__(
-        self,
-        graph: nx.Graph,
-        penalty_override: Optional[float] = None,
-    ):
-        self.graph = graph
-        self.nodes = sorted(list(graph.nodes()))
-        self.num_nodes = len(self.nodes)
+    def __init__(self, nodes):
+        self.nodes = nodes
 
-        # ----------------------------------------------------
-        # Función objetivo:
-        #     maximizar sum(weight_i * x_i)
-        # ----------------------------------------------------
+    def calculate_weights(self):
+        weights = {}
 
-        self.weights = {
-            n: float(graph.nodes[n].get("weight", 1.0))
-            for n in self.nodes
-        }
+        for node in self.nodes:
+            node_id = node["id"]
 
-        self.max_weight = max(
-            self.weights.values(),
-            default=1.0,
-        )
+            if "weight" in node:
+                weights[node_id] = float(node["weight"])
+            else:
+                passenger_km = float(node.get("passenger_km", 0))
+                empty_km = float(node.get("empty_km", 0))
 
-        # Penalización:
-        #
-        # lambda = 4 * max(weight)
-        #
-        # garantiza que una solución con conflicto sea
-        # suficientemente penalizada frente a seleccionar
-        # un nodo individual de mayor peso.
+                weights[node_id] = (
+                    2.0 * passenger_km - empty_km
+                )
 
-        self.lambda_penalty = (
-            float(penalty_override)
-            if penalty_override is not None
-            else 4.0 * self.max_weight
-        )
-
-        # Índice nodo -> posición del qubit
-        self.node_index = {
-            node: i
-            for i, node in enumerate(self.nodes)
-        }
-
-    # --------------------------------------------------------
-    # Conversión bitstring -> bits
-    # --------------------------------------------------------
-
-    def bitstring_to_bits(self, bitstring: str) -> List[int]:
-        """
-        Convierte el bitstring de Qiskit a bits alineados
-        con self.nodes.
-
-        Qiskit devuelve el bitstring con el bit de mayor índice
-        a la izquierda. Por eso se invierte mediante [-i-1].
-        """
-
-        clean = bitstring.replace(" ", "")
-
-        if len(clean) != self.num_nodes:
-            raise ValueError(
-                f"Bitstring inválido: longitud {len(clean)}, "
-                f"se esperaban {self.num_nodes} bits."
-            )
-
-        return [
-            1 if clean[-(i + 1)] == "1" else 0
-            for i in range(self.num_nodes)
-        ]
-
-    # --------------------------------------------------------
-    # Energía QUBO
-    # --------------------------------------------------------
-
-    def qubo_energy(self, bitstring: str) -> float:
-        """
-        Calcula:
-
-            H(x) =
-                -sum(w_i*x_i)
-                + lambda*sum(x_i*x_j)
-
-        para las aristas del grafo.
-
-        MENOR energía = MEJOR solución.
-        """
-
-        bits = self.bitstring_to_bits(bitstring)
-
-        energy = 0.0
-
-        # Término lineal
-        for i, node in enumerate(self.nodes):
-            if bits[i]:
-                energy -= self.weights[node]
-
-        # Penalización por conflictos
-        for u, v in self.graph.edges():
-
-            i = self.node_index[u]
-            j = self.node_index[v]
-
-            if bits[i] and bits[j]:
-                energy += self.lambda_penalty
-
-        return energy
-
-    # --------------------------------------------------------
-    # Peso de una solución
-    # --------------------------------------------------------
-
-    def solution_weight(self, selected_nodes: List[str]) -> float:
-        return sum(
-            self.weights[n]
-            for n in selected_nodes
-        )
-
-    # --------------------------------------------------------
-    # Factibilidad
-    # --------------------------------------------------------
-
-    def is_feasible(
-        self,
-        selected_nodes: List[str],
-    ) -> bool:
-
-        selected = set(selected_nodes)
-
-        return all(
-            not (u in selected and v in selected)
-            for u, v in self.graph.edges()
-        )
-
-    # --------------------------------------------------------
-    # Ground Truth exacto
-    # --------------------------------------------------------
-
-    def solve_exact_ground_truth(
-        self,
-    ) -> Tuple[List[str], float]:
-        """
-        Resuelve exactamente MWIS mediante:
-
-            MWIS(G) = Maximum Weight Clique(complement(G))
-
-        Se utiliza exclusivamente como referencia para evaluar
-        el resultado QAOA en esta PoC.
-        """
-
-        complement_graph = nx.complement(self.graph)
-
-        for node in complement_graph.nodes():
-            complement_graph.nodes[node]["weight"] = int(
-                self.weights[node]
-            )
-
-        clique, weight = nx.max_weight_clique(
-            complement_graph,
-            weight="weight",
-        )
-
-        return sorted(clique), float(weight)
+        return weights
 
 
 # ============================================================
-# PODA / REPARACIÓN
+# PRUNER / REPAIR
 # ============================================================
 
 class MWISPruner:
     """
-    Repara una solución que contenga conflictos.
+    Deterministic repair of an infeasible solution.
 
-    Elimina iterativamente el nodo con menor relación:
-
-        weight / degree
-
-    entre los nodos implicados en conflictos.
+    Nodes are considered according to weight / degree ratio.
     """
 
     @staticmethod
-    def prune(
-        graph: nx.Graph,
-        initial_selected: List[str],
-    ) -> Tuple[List[str], List[str]]:
-
-        selected = set(initial_selected)
-        pruned_nodes: List[str] = []
+    def prune_solution(graph, selected_nodes, weights):
+        selected = set(selected_nodes)
 
         while True:
+            conflicts = []
 
-            subgraph = graph.subgraph(selected)
-
-            conflicts = list(subgraph.edges())
+            for u in selected:
+                for v in selected:
+                    if u != v and graph.has_edge(u, v):
+                        conflicts.append((u, v))
 
             if not conflicts:
                 break
 
-            conflict_nodes = set()
+            # Determine the node to remove from the first conflict.
+            u, v = conflicts[0]
 
-            for u, v in conflicts:
-                conflict_nodes.add(u)
-                conflict_nodes.add(v)
+            degree_u = max(graph.degree(u), 1)
+            degree_v = max(graph.degree(v), 1)
 
-            worst_node = min(
-                conflict_nodes,
-                key=lambda n: (
-                    float(graph.nodes[n].get("weight", 0.0))
-                    / max(1, subgraph.degree(n))
-                ),
-            )
+            score_u = weights[u] / degree_u
+            score_v = weights[v] / degree_v
 
-            selected.remove(worst_node)
-            pruned_nodes.append(worst_node)
+            if score_u < score_v:
+                selected.remove(u)
+            else:
+                selected.remove(v)
 
-        return (
-            sorted(selected),
-            sorted(pruned_nodes),
-        )
+        return sorted(selected)
 
 
 # ============================================================
-# VISUALIZACIÓN
+# VISUALIZATION
 # ============================================================
 
 class VisualizationAssetGenerator:
-    """Genera el PNG del grafo de conflictos."""
 
     @staticmethod
-    def generate_conflict_graph_visualization(
-        graph: nx.Graph,
-        selected: List[str],
-        pruned: List[str],
-        filename: str = "conflict_graph.png",
-    ) -> Optional[str]:
+    def generate_conflict_graph(graph, selected_nodes):
+        output_dir = Path("additional_output")
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
+        path = output_dir / "conflict_graph.png"
 
-            output_dir = "additional_output"
-            os.makedirs(output_dir, exist_ok=True)
+        plt.figure(figsize=(9, 7), dpi=150)
 
-            path = os.path.join(
-                output_dir,
-                filename,
-            )
+        pos = nx.spring_layout(
+            graph,
+            seed=42
+        )
 
-            plt.figure(
-                figsize=(9, 7),
-                dpi=150,
-            )
+        selected_nodes = set(selected_nodes)
 
-            pos = nx.spring_layout(
-                graph,
-                seed=42,
-            )
+        node_sizes = []
+        for node in graph.nodes:
+            if node in selected_nodes:
+                node_sizes.append(900)
+            else:
+                node_sizes.append(600)
 
-            node_colors = []
+        nx.draw_networkx_nodes(
+            graph,
+            pos,
+            node_size=node_sizes
+        )
 
-            for node in graph.nodes():
+        nx.draw_networkx_edges(
+            graph,
+            pos,
+            width=1.5
+        )
 
-                if node in selected:
-                    node_colors.append("#2ecc71")
+        nx.draw_networkx_labels(
+            graph,
+            pos,
+            font_size=10
+        )
 
-                elif node in pruned:
-                    node_colors.append("#e74c3c")
+        plt.title(
+            "Railway Rolling Stock Cycle Conflict Graph"
+        )
 
-                else:
-                    node_colors.append("#95a5a6")
+        plt.axis("off")
+        plt.savefig(
+            path,
+            bbox_inches="tight"
+        )
+        plt.close()
 
-            nx.draw_networkx_nodes(
-                graph,
-                pos,
-                node_color=node_colors,
-                node_size=800,
-                edgecolors="#2c3e50",
-            )
+        logger.info(
+            "Visualización guardada en %s",
+            path
+        )
 
-            nx.draw_networkx_edges(
-                graph,
-                pos,
-                edge_color="#e74c3c",
-                width=1.5,
-                alpha=0.7,
-            )
-
-            labels = {
-                node: (
-                    f"{node}\n"
-                    f"(w={graph.nodes[node]['weight']:.0f})"
-                )
-                for node in graph.nodes()
-            }
-
-            nx.draw_networkx_labels(
-                graph,
-                pos,
-                labels=labels,
-                font_size=8,
-                font_weight="bold",
-                font_color="black",
-            )
-
-            plt.title(
-                "Grafo de Conflictos de Material Rodante (MWIS)",
-                fontsize=12,
-                fontweight="bold",
-            )
-
-            plt.axis("off")
-            plt.tight_layout()
-
-            plt.savefig(
-                path,
-                bbox_inches="tight",
-            )
-
-            plt.close()
-
-            logger.info(
-                "Visualización guardada en %s",
-                path,
-            )
-
-            return path
-
-        except Exception as exc:
-
-            logger.warning(
-                "No se pudo generar la imagen del grafo: %s",
-                exc,
-            )
-
-            return None
+        return str(path)
 
 
 # ============================================================
-# CONSTRUCCIÓN DEL GRAFO
+# GRAPH
 # ============================================================
 
-def build_conflict_graph(
-    nodes_raw: List[Dict[str, Any]],
-    edges_raw: List[List[str]],
-) -> Tuple[nx.Graph, set]:
-    """
-    Construye el grafo de conflictos.
-
-    Si se proporcionan edges explícitamente:
-        se utilizan esas relaciones.
-
-    Si no se proporcionan:
-        se generan conflictos automáticamente cuando dos ciclos
-        comparten algún trip.
-    """
+def build_conflict_graph(input_data):
+    nodes = input_data.get("nodes", [])
+    edges = input_data.get("edges", [])
 
     graph = nx.Graph()
-    all_trips = set()
 
-    # --------------------------------------------------------
-    # NODOS
-    # --------------------------------------------------------
+    for node in nodes:
+        node_id = node["id"]
+        graph.add_node(node_id)
 
-    for node_data in nodes_raw:
-
-        node_id = node_data["id"]
-
-        trips = node_data.get("trips", [])
-
-        all_trips.update(trips)
-
-        passenger_km = float(
-            node_data.get("passenger_km", 0.0)
-        )
-
-        empty_km = float(
-            node_data.get("empty_km", 0.0)
-        )
-
-        # ----------------------------------------------------
-        # FUNCIÓN OBJETIVO
-        # ----------------------------------------------------
-        #
-        # Si "weight" está presente, ES el valor objetivo.
-        #
-        # Si no está presente, se calcula:
-        #
-        #     weight = 2*passenger_km - empty_km
-        #
-        # Esto evita mezclar silenciosamente dos definiciones.
-        # ----------------------------------------------------
-
-        if "weight" in node_data:
-
-            weight = float(node_data["weight"])
-
-        else:
-
-            weight = (
-                2.0 * passenger_km
-                - empty_km
+    for edge in edges:
+        if len(edge) != 2:
+            raise ValueError(
+                f"Invalid edge format: {edge}"
             )
 
-        operating_cost = float(
-            node_data.get("operating_cost", 0.0)
-        )
+        u = edge[0]
+        v = edge[1]
 
-        graph.add_node(
-            node_id,
-            weight=weight,
-            trips=trips,
-            passenger_km=passenger_km,
-            empty_km=empty_km,
-            operating_cost=operating_cost,
-        )
+        if u not in graph:
+            raise ValueError(
+                f"Unknown node in edge: {u}"
+            )
 
-    # --------------------------------------------------------
-    # ARISTAS EXPLÍCITAS
-    # --------------------------------------------------------
+        if v not in graph:
+            raise ValueError(
+                f"Unknown node in edge: {v}"
+            )
 
-    if edges_raw:
+        graph.add_edge(u, v)
 
-        for edge in edges_raw:
-
-            if not isinstance(edge, (list, tuple)):
-                logger.warning(
-                    "Arista ignorada: formato inválido %r",
-                    edge,
-                )
-                continue
-
-            if len(edge) != 2:
-                logger.warning(
-                    "Arista ignorada: se esperaban 2 nodos: %r",
-                    edge,
-                )
-                continue
-
-            # CORRECCIÓN CLAVE:
-            #
-            # antes:
-            #     u, v = e, e[6]
-            #
-            # correcto:
-            #     u, v = e[0], e[1]
-
-            u = edge[0]
-            v = edge[1]
-
-            if u not in graph:
-                logger.warning(
-                    "Arista ignorada: nodo inexistente %s",
-                    u,
-                )
-                continue
-
-            if v not in graph:
-                logger.warning(
-                    "Arista ignorada: nodo inexistente %s",
-                    v,
-                )
-                continue
-
-            if u == v:
-                logger.warning(
-                    "Autoconflicto ignorado: %s",
-                    u,
-                )
-                continue
-
-            graph.add_edge(u, v)
-
-    # --------------------------------------------------------
-    # GENERACIÓN AUTOMÁTICA DE CONFLICTOS
-    # --------------------------------------------------------
-
-    else:
-
-        node_list = list(graph.nodes())
-
-        for i in range(len(node_list)):
-
-            for j in range(i + 1, len(node_list)):
-
-                u = node_list[i]
-                v = node_list[j]
-
-                trips_u = set(
-                    graph.nodes[u]["trips"]
-                )
-
-                trips_v = set(
-                    graph.nodes[v]["trips"]
-                )
-
-                if trips_u & trips_v:
-                    graph.add_edge(u, v)
-
-    logger.info(
-        "Grafo construido: %d nodos, %d conflictos",
-        graph.number_of_nodes(),
-        graph.number_of_edges(),
-    )
-
-    return graph, all_trips
+    return graph
 
 
 # ============================================================
-# CIRCUITO QAOA
+# QUBO
+# ============================================================
+
+def calculate_penalty(weights):
+    """
+    Penalty chosen as:
+
+        lambda = 4 * max(weight)
+
+    This is sufficiently large for the current MWIS formulation.
+    """
+
+    if not weights:
+        return 1.0
+
+    return 4.0 * max(weights.values())
+
+
+def calculate_qubo_energy(
+    bitstring,
+    graph,
+    weights,
+    penalty
+):
+    """
+    H(x) =
+        - sum(w_i x_i)
+        + lambda sum(x_i x_j)
+    """
+
+    nodes = list(graph.nodes)
+
+    if len(bitstring) != len(nodes):
+        raise ValueError(
+            "Bitstring length does not match number of nodes"
+        )
+
+    energy = 0.0
+
+    selected = {}
+
+    for index, node in enumerate(nodes):
+        value = int(bitstring[index])
+        selected[node] = value
+
+        energy -= weights[node] * value
+
+    for u, v in graph.edges:
+        energy += (
+            penalty
+            * selected[u]
+            * selected[v]
+        )
+
+    return float(energy)
+
+
+# ============================================================
+# QAOA CIRCUIT
 # ============================================================
 
 def build_qaoa_circuit(
-    objective: MWISObjective,
-    qaoa_depth: int,
-) -> QuantumCircuit:
+    graph,
+    weights,
+    penalty,
+    depth=2
+):
     """
-    Construye el circuito QAOA correspondiente al Hamiltoniano
-    Ising de MWIS.
+    Builds a simple QAOA circuit for the MWIS QUBO.
+
+    The parameters are intentionally fixed/heuristic for this PoC.
     """
 
-    if not QISKIT_AVAILABLE:
+    if QuantumCircuit is None:
         raise RuntimeError(
-            "Qiskit no está disponible."
+            "Qiskit is not available"
         )
 
-    if qaoa_depth < 1:
-        raise ValueError(
-            "qaoa_depth debe ser >= 1."
-        )
+    nodes = list(graph.nodes)
+    n = len(nodes)
 
-    n_qubits = objective.num_nodes
+    node_index = {
+        node: index
+        for index, node in enumerate(nodes)
+    }
 
-    qr = QuantumRegister(
-        n_qubits,
-        "q",
-    )
+    qc = QuantumCircuit(n, n)
 
-    cr = ClassicalRegister(
-        n_qubits,
-        "c",
-    )
+    # Initial |+> state
+    for q in range(n):
+        qc.h(q)
 
-    qc = QuantumCircuit(
-        qr,
-        cr,
-    )
+    # Heuristic QAOA parameters
+    beta = 0.35
+    gamma = 0.20
 
-    # --------------------------------------------------------
-    # Estado inicial |+>
-    # --------------------------------------------------------
+    for _ in range(depth):
 
-    for i in range(n_qubits):
-        qc.h(qr[i])
+        # ----------------------------------------------------
+        # Cost Hamiltonian
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
-    # Parámetros heurísticos
-    #
-    # No se realiza optimización variacional en esta PoC.
-    # --------------------------------------------------------
+        for node in nodes:
+            q = node_index[node]
 
-    gamma_values = [
-        0.05 / (layer + 1)
-        for layer in range(qaoa_depth)
-    ]
-
-    beta_values = [
-        0.25 / (layer + 1)
-        for layer in range(qaoa_depth)
-    ]
-
-    # --------------------------------------------------------
-    # Capas QAOA
-    # --------------------------------------------------------
-
-    for layer in range(qaoa_depth):
-
-        gamma = gamma_values[layer]
-        beta = beta_values[layer]
-
-        # --------------------------------------------
-        # Términos lineales
-        #
-        # h_i = w_i/2 - lambda*degree(i)/4
-        # --------------------------------------------
-
-        for i, node in enumerate(objective.nodes):
-
-            degree = objective.graph.degree(node)
-
-            h_i = (
-                objective.weights[node] / 2.0
-                - (
-                    objective.lambda_penalty
-                    * degree
-                    / 4.0
-                )
-            )
+            # QUBO linear term:
+            #
+            # -weight * x
+            #
+            # x = (1-Z)/2
+            #
+            # The exact constant is irrelevant for optimization.
+            angle = gamma * weights[node]
 
             qc.rz(
-                2.0 * gamma * h_i,
-                qr[i],
+                2.0 * angle,
+                q
             )
 
-        # --------------------------------------------
-        # Términos ZZ
-        #
-        # J_ij = lambda / 4
-        # --------------------------------------------
+        for u, v in graph.edges:
+            qu = node_index[u]
+            qv = node_index[v]
 
-        for u, v in objective.graph.edges():
-
-            i = objective.node_index[u]
-            j = objective.node_index[v]
-
-            coupling = (
-                objective.lambda_penalty / 4.0
+            qc.cx(qu, qv)
+            qc.rz(
+                2.0 * gamma * penalty,
+                qv
             )
+            qc.cx(qu, qv)
 
-            qc.rzz(
-                2.0 * gamma * coupling,
-                qr[i],
-                qr[j],
-            )
-
-        # --------------------------------------------
+        # ----------------------------------------------------
         # Mixer
-        # --------------------------------------------
+        # ----------------------------------------------------
 
-        for i in range(n_qubits):
-
+        for q in range(n):
             qc.rx(
                 2.0 * beta,
-                qr[i],
+                q
             )
 
     qc.measure(
-        qr,
-        cr,
+        range(n),
+        range(n)
     )
 
     return qc
 
 
 # ============================================================
-# SELECCIÓN DEL MEJOR BITSTRING
+# QAOA BITSTRING SELECTION
 # ============================================================
 
 def select_best_qaoa_bitstring(
-    counts: Dict[str, int],
-    objective: MWISObjective,
-) -> Tuple[str, float]:
+    counts,
+    graph,
+    weights,
+    penalty
+):
     """
-    Selecciona el estado de menor energía QUBO entre los
-    estados realmente observados.
+    Selects the observed bitstring with the minimum QUBO energy.
 
-    En caso de empate energético:
-        se prefiere el estado con mayor número de shots.
-
-    CORRECCIÓN CLAVE:
-        no se utiliza simplemente max(counts, key=counts.get).
+    If several bitstrings have the same energy, the one with the
+    largest number of shots is selected.
     """
 
-    if not counts:
-        raise ValueError(
-            "QAOA no produjo resultados."
+    candidates = []
+
+    for bitstring, shots in counts.items():
+
+        clean_bitstring = bitstring.replace(" ", "")
+
+        energy = calculate_qubo_energy(
+            clean_bitstring,
+            graph,
+            weights,
+            penalty
         )
 
-    best_bitstring = min(
-        counts.keys(),
-        key=lambda bitstring: (
-            objective.qubo_energy(bitstring),
-            -counts[bitstring],
-        ),
-    )
+        candidates.append(
+            (
+                energy,
+                -shots,
+                clean_bitstring
+            )
+        )
 
-    best_energy = objective.qubo_energy(
+    if not candidates:
+        raise RuntimeError(
+            "No QAOA measurement results were returned"
+        )
+
+    candidates.sort()
+
+    best_energy = candidates[0][0]
+    best_bitstring = candidates[0][2]
+
+    logger.info(
+        "Best observed QAOA bitstring: %s",
         best_bitstring
     )
 
-    return (
-        best_bitstring,
-        best_energy,
+    logger.info(
+        "Best QUBO energy: %.6f",
+        best_energy
     )
+
+    return best_bitstring, best_energy
 
 
 # ============================================================
-# BITSTRING -> SOLUCIÓN
+# BITSTRING → NODES
 # ============================================================
 
 def bitstring_to_selected_nodes(
-    bitstring: str,
-    objective: MWISObjective,
-) -> List[str]:
+    bitstring,
+    graph
+):
+    nodes = list(graph.nodes)
 
-    bits = objective.bitstring_to_bits(
-        bitstring
+    if len(bitstring) != len(nodes):
+        raise ValueError(
+            "Bitstring length does not match graph size"
+        )
+
+    selected = []
+
+    for index, bit in enumerate(bitstring):
+        if bit == "1":
+            selected.append(nodes[index])
+
+    return selected
+
+
+# ============================================================
+# FEASIBILITY
+# ============================================================
+
+def check_feasibility(
+    graph,
+    selected_nodes
+):
+    selected_nodes = list(selected_nodes)
+
+    for i in range(len(selected_nodes)):
+        for j in range(i + 1, len(selected_nodes)):
+
+            u = selected_nodes[i]
+            v = selected_nodes[j]
+
+            if graph.has_edge(u, v):
+                return False
+
+    return True
+
+
+# ============================================================
+# EXACT GROUND TRUTH
+# ============================================================
+
+def calculate_exact_mwis(
+    graph,
+    weights
+):
+    """
+    Exact MWIS using maximum-weight clique on the complement graph.
+
+    NetworkX requires integer node weights for max_weight_clique().
+    """
+
+    complement = nx.complement(graph)
+
+    integer_weights = {
+        node: int(round(weights[node]))
+        for node in complement.nodes
+    }
+
+    nx.set_node_attributes(
+        complement,
+        integer_weights,
+        "weight"
     )
 
-    return [
-        objective.nodes[i]
-        for i, bit in enumerate(bits)
-        if bit == 1
+    clique, integer_weight = nx.max_weight_clique(
+        complement,
+        weight="weight"
+    )
+
+    selected_nodes = sorted(clique)
+
+    total_weight = sum(
+        weights[node]
+        for node in selected_nodes
+    )
+
+    return (
+        selected_nodes,
+        float(total_weight)
+    )
+
+
+# ============================================================
+# OPERATIONAL METRICS
+# ============================================================
+
+def calculate_operational_metrics(
+    nodes,
+    selected_nodes
+):
+    selected_set = set(selected_nodes)
+
+    selected_data = [
+        node
+        for node in nodes
+        if node["id"] in selected_set
     ]
 
-
-# ============================================================
-# FUNCIÓN PRINCIPAL QCENTROID
-# ============================================================
-
-def run(
-    input_data: Dict[str, Any],
-    solver_params: Dict[str, Any],
-    extra_arguments: Dict[str, Any],
-) -> Dict[str, Any]:
-
-    logger.info("=" * 70)
-    logger.info(
-        "Iniciando Solver QCentroid MWIS de Material Rodante"
+    total_passenger_km = sum(
+        float(node.get("passenger_km", 0))
+        for node in selected_data
     )
-    logger.info("=" * 70)
 
-    start_time = time.time()
+    total_empty_km = sum(
+        float(node.get("empty_km", 0))
+        for node in selected_data
+    )
 
-    try:
+    total_operating_cost = sum(
+        float(node.get("operating_cost", 0))
+        for node in selected_data
+    )
 
-        # ====================================================
-        # PARÁMETROS
-        # ====================================================
+    return {
+        "total_passenger_km": total_passenger_km,
+        "total_empty_km": total_empty_km,
+        "total_operating_cost": total_operating_cost
+    }
 
-        iqm_token = (
-            solver_params.get("iqm_token")
-            or extra_arguments.get("iqm_token")
-            or extra_arguments.get("api_token")
-            or os.environ.get("IQM_TOKEN")
-            or os.environ.get("QCENTROID_TOKEN")
+
+# ============================================================
+# COVERAGE
+# ============================================================
+
+def calculate_coverage(
+    nodes,
+    selected_nodes
+):
+    scheduled_trips = set()
+
+    covered_trips = set()
+
+    selected_set = set(selected_nodes)
+
+    for node in nodes:
+
+        trips = node.get("trips", [])
+
+        scheduled_trips.update(trips)
+
+        if node["id"] in selected_set:
+            covered_trips.update(trips)
+
+    if not scheduled_trips:
+        coverage_percent = 0.0
+    else:
+        coverage_percent = (
+            len(covered_trips)
+            / len(scheduled_trips)
+            * 100.0
         )
 
-        quantum_computer = solver_params.get(
-            "quantum_computer",
-            "emerald",
-        )
+    return (
+        len(scheduled_trips),
+        len(covered_trips),
+        float(coverage_percent)
+    )
 
-        raw_server_url = solver_params.get(
-            "server_url",
-            "https://resonance.iqm.tech/",
-        )
 
-        server_url = URLSanitizer.sanitize_iqm_url(
-            raw_server_url
-        )
+# ============================================================
+# BACKEND EXECUTION
+# ============================================================
 
-        shots = int(
-            solver_params.get(
-                "shots",
-                2048,
-            )
-        )
+def execute_qaoa(
+    circuit,
+    shots,
+    backend_name=None
+):
+    """
+    Executes QAOA.
 
-        qaoa_depth = int(
-            solver_params.get(
-                "qaoa_depth",
-                2,
-            )
-        )
+    If IQM Resonance is configured, it is used.
 
-        penalty_param = solver_params.get(
-            "penalty"
-        )
+    Otherwise AerSimulator is used as a fallback.
+    """
 
-        # ====================================================
-        # VALIDACIÓN
-        # ====================================================
+    # --------------------------------------------------------
+    # IQM
+    # --------------------------------------------------------
 
-        if shots <= 0:
-            raise ValueError(
-                "shots debe ser > 0."
-            )
+    iqm_token = (
+        os.getenv("IQM_TOKEN")
+        or os.getenv("IQM_API_TOKEN")
+    )
 
-        if qaoa_depth <= 0:
-            raise ValueError(
-                "qaoa_depth debe ser >= 1."
-            )
+    iqm_url = os.getenv(
+        "IQM_URL",
+        "https://resonance.cloud"
+    )
 
-        nodes_raw = input_data.get(
-            "nodes",
-            [],
-        )
+    if (
+        iqm_token
+        and IQMProvider is not None
+    ):
 
-        edges_raw = input_data.get(
-            "edges",
-            [],
-        )
-
-        if not nodes_raw:
-
-            return {
-                "selected_cycles": [],
-                "total_weight": 0.0,
-                "is_feasible": False,
-                "error": "Dataset de entrada vacío.",
-            }
-
-        # ====================================================
-        # CONSTRUIR GRAFO
-        # ====================================================
-
-        graph, all_trips = build_conflict_graph(
-            nodes_raw,
-            edges_raw,
-        )
-
-        # ====================================================
-        # OBJETIVO MWIS
-        # ====================================================
-
-        objective = MWISObjective(
-            graph,
-            penalty_override=penalty_param,
-        )
-
-        logger.info(
-            "Función objetivo: maximizar sum(weight_i * x_i)"
-        )
-
-        logger.info(
-            "Penalización QUBO: %.4f",
-            objective.lambda_penalty,
-        )
-
-        # ====================================================
-        # GROUND TRUTH EXACTO
-        # ====================================================
-
-        exact_cycles, exact_weight = (
-            objective.solve_exact_ground_truth()
-        )
-
-        logger.info(
-            "Ground Truth exacto: %s | Peso óptimo: %.4f",
-            exact_cycles,
-            exact_weight,
-        )
-
-        # ====================================================
-        # BACKEND
-        # ====================================================
-
-        backend = None
-
-        backend_info = "Solución exacta clásica"
-
-        job_id = "local"
-
-        # ----------------------------------------------------
-        # IQM
-        # ----------------------------------------------------
-
-        if iqm_token and IQM_AVAILABLE:
-
-            try:
-
-                logger.info(
-                    "Conectando con IQM Resonance (%s)...",
-                    quantum_computer,
-                )
-
-                provider = IQMProvider(
-                    url=server_url,
-                    quantum_computer=quantum_computer,
-                    token=iqm_token,
-                )
-
-                backend = provider.get_backend()
-
-                backend_info = (
-                    f"IQM Resonance ({quantum_computer})"
-                )
-
-            except Exception as exc:
-
-                logger.warning(
-                    "No se pudo conectar con IQM: %s",
-                    exc,
-                )
-
-        # ----------------------------------------------------
-        # AER
-        # ----------------------------------------------------
-
-        if backend is None and AER_AVAILABLE:
-
-            backend = AerSimulator()
-
-            backend_info = (
-                "Qiskit AerSimulator (CPU)"
-            )
-
-        # ====================================================
-        # SOLUCIÓN
-        # ====================================================
-
-        best_bitstring = "N/A"
-        best_qubo_energy: Optional[float] = None
-
-        raw_selected: List[str]
-
-        if backend is not None and QISKIT_AVAILABLE:
-
-            # ------------------------------------------------
-            # Construcción QAOA
-            # ------------------------------------------------
-
-            qc = build_qaoa_circuit(
-                objective,
-                qaoa_depth,
-            )
-
-            qc_transpiled = transpile(
-                qc,
-                backend=backend,
-                optimization_level=2,
-            )
-
+        try:
             logger.info(
-                "Ejecutando QAOA p=%d en %s (%d shots)...",
-                qaoa_depth,
-                backend_info,
-                shots,
+                "Attempting IQM Resonance execution"
             )
 
-            q_job = backend.run(
-                qc_transpiled,
-                shots=shots,
+            provider = IQMProvider(
+                iqm_url,
+                token=iqm_token
             )
 
-            job_id_attr = getattr(
-                q_job,
-                "job_id",
-                None,
+            if backend_name:
+                backend = provider.get_backend(
+                    backend_name
+                )
+            else:
+                backend = provider.get_backend(
+                    "IQM Resonance (emerald)"
+                )
+
+            job = backend.run(
+                circuit,
+                shots=shots
             )
 
-            if callable(job_id_attr):
-                job_id = job_id_attr()
-
-            elif job_id_attr is not None:
-                job_id = str(job_id_attr)
-
-            result = q_job.result()
+            result = job.result()
 
             counts = result.get_counts()
 
-            # ------------------------------------------------
-            # CORRECCIÓN CLAVE:
-            #
-            # Seleccionar por MENOR ENERGÍA QUBO.
-            # ------------------------------------------------
-
-            best_bitstring, best_qubo_energy = (
-                select_best_qaoa_bitstring(
-                    counts,
-                    objective,
-                )
+            return (
+                counts,
+                "IQM Resonance (emerald)",
+                getattr(job, "job_id", lambda: None)()
             )
 
-            raw_selected = (
-                bitstring_to_selected_nodes(
-                    best_bitstring,
-                    objective,
-                )
+        except Exception as exc:
+
+            logger.warning(
+                "IQM execution failed: %s",
+                exc
             )
 
-            logger.info(
-                "Mejor bitstring observado: %s",
-                best_bitstring,
+            logger.warning(
+                "Falling back to AerSimulator"
             )
 
-            logger.info(
-                "Energía QUBO: %.4f",
-                best_qubo_energy,
-            )
+    # --------------------------------------------------------
+    # AER
+    # --------------------------------------------------------
 
-            logger.info(
-                "Solución QAOA inicial: %s",
-                raw_selected,
-            )
-
-        else:
-
-            # ------------------------------------------------
-            # Fallback clásico
-            #
-            # Utilizamos el Ground Truth exacto para garantizar
-            # que la PoC siga siendo funcional sin Qiskit.
-            # ------------------------------------------------
-
-            raw_selected = exact_cycles
-
-            backend_info = (
-                "Solución exacta clásica "
-                "(fallback sin backend cuántico)"
-            )
-
-            logger.info(
-                "Qiskit/backend no disponible. "
-                "Usando Ground Truth exacto como fallback."
-            )
-
-        # ====================================================
-        # REPARACIÓN / PODA
-        # ====================================================
-
-        final_selected, pruned_nodes = (
-            MWISPruner.prune(
-                graph,
-                raw_selected,
-            )
+    if AerSimulator is None:
+        raise RuntimeError(
+            "Neither IQM nor Qiskit Aer is available"
         )
 
-        # ====================================================
-        # MÉTRICAS
-        # ====================================================
+    simulator = AerSimulator()
 
-        final_weight = (
-            objective.solution_weight(
-                final_selected
-            )
+    job = simulator.run(
+        circuit,
+        shots=shots
+    )
+
+    result = job.result()
+
+    counts = result.get_counts()
+
+    return (
+        counts,
+        "AerSimulator",
+        None
+    )
+
+
+# ============================================================
+# MAIN SOLVER
+# ============================================================
+
+def run(
+    input_data,
+    solver_params=None,
+    extra_arguments=None
+):
+
+    solver_params = solver_params or {}
+    extra_arguments = extra_arguments or {}
+
+    start_time = time.perf_counter()
+
+    # --------------------------------------------------------
+    # PARAMETERS
+    # --------------------------------------------------------
+
+    qaoa_depth = int(
+        solver_params.get(
+            "qaoa_depth",
+            2
+        )
+    )
+
+    shots = int(
+        solver_params.get(
+            "shots",
+            2048
+        )
+    )
+
+    backend_name = solver_params.get(
+        "backend"
+    )
+
+    # --------------------------------------------------------
+    # INPUT
+    # --------------------------------------------------------
+
+    nodes = input_data.get("nodes", [])
+
+    if not nodes:
+        raise ValueError(
+            "Input must contain at least one node"
         )
 
-        covered_trips = set()
+    graph = build_conflict_graph(
+        input_data
+    )
 
-        total_passenger_km = 0.0
-        total_empty_km = 0.0
-        total_operating_cost = 0.0
+    logger.info(
+        "Graph: %d nodes, %d conflicts",
+        graph.number_of_nodes(),
+        graph.number_of_edges()
+    )
 
-        for node in final_selected:
+    # --------------------------------------------------------
+    # OBJECTIVE
+    # --------------------------------------------------------
 
-            data = graph.nodes[node]
+    objective = MWISObjective(nodes)
 
-            covered_trips.update(
-                data["trips"]
-            )
+    weights = objective.calculate_weights()
 
-            total_passenger_km += (
-                data["passenger_km"]
-            )
+    logger.info(
+        "Objective: maximize sum(weight_i*x_i)"
+    )
 
-            total_empty_km += (
-                data["empty_km"]
-            )
+    # --------------------------------------------------------
+    # PENALTY
+    # --------------------------------------------------------
 
-            total_operating_cost += (
-                data["operating_cost"]
-            )
+    penalty = calculate_penalty(weights)
 
-        coverage_rate = (
-            len(covered_trips)
-            / len(all_trips)
-            if all_trips
-            else 1.0
+    logger.info(
+        "Penalty: %.6f",
+        penalty
+    )
+
+    # --------------------------------------------------------
+    # EXACT GROUND TRUTH
+    # --------------------------------------------------------
+
+    exact_selected, exact_weight = (
+        calculate_exact_mwis(
+            graph,
+            weights
         )
+    )
 
-        feasible = objective.is_feasible(
-            final_selected
-        )
+    logger.info(
+        "Exact MWIS: %s",
+        exact_selected
+    )
 
-        exec_time = (
-            time.time()
-            - start_time
+    logger.info(
+        "Exact total weight: %.6f",
+        exact_weight
+    )
+
+    # --------------------------------------------------------
+    # QAOA
+    # --------------------------------------------------------
+
+    circuit = build_qaoa_circuit(
+        graph,
+        weights,
+        penalty,
+        depth=qaoa_depth
+    )
+
+    counts, backend_used, job_id = execute_qaoa(
+        circuit,
+        shots=shots,
+        backend_name=backend_name
+    )
+
+    (
+        initial_bitstring,
+        initial_qubo_energy
+    ) = select_best_qaoa_bitstring(
+        counts,
+        graph,
+        weights,
+        penalty
+    )
+
+    initial_selected = (
+        bitstring_to_selected_nodes(
+            initial_bitstring,
+            graph
         )
+    )
+
+    # --------------------------------------------------------
+    # REPAIR / PRUNING
+    # --------------------------------------------------------
+
+    selected_cycles = MWISPruner.prune_solution(
+        graph,
+        initial_selected,
+        weights
+    )
+
+    selected_cycles = sorted(selected_cycles)
+
+    # --------------------------------------------------------
+    # FEASIBILITY
+    # --------------------------------------------------------
+
+    is_feasible = check_feasibility(
+        graph,
+        selected_cycles
+    )
+
+    # --------------------------------------------------------
+    # SOLUTION WEIGHT
+    # --------------------------------------------------------
+
+    total_weight = sum(
+        weights[node]
+        for node in selected_cycles
+    )
+
+    # --------------------------------------------------------
+    # OPTIMALITY GAP
+    # --------------------------------------------------------
+
+    if exact_weight != 0:
+        optimality_gap_percent = (
+            (exact_weight - total_weight)
+            / abs(exact_weight)
+            * 100.0
+        )
+    else:
+        optimality_gap_percent = 0.0
+
+    # Numerical protection
+    if abs(optimality_gap_percent) < 1e-12:
+        optimality_gap_percent = 0.0
+
+    # --------------------------------------------------------
+    # COVERAGE
+    # --------------------------------------------------------
+
+    (
+        scheduled_trips,
+        covered_trips,
+        coverage_percent
+    ) = calculate_coverage(
+        nodes,
+        selected_cycles
+    )
+
+    # --------------------------------------------------------
+    # OPERATIONAL METRICS
+    # --------------------------------------------------------
+
+    operational = calculate_operational_metrics(
+        nodes,
+        selected_cycles
+    )
+
+    # --------------------------------------------------------
+    # EXECUTION TIME
+    # --------------------------------------------------------
+
+    execution_time_seconds = (
+        time.perf_counter()
+        - start_time
+    )
+
+    # --------------------------------------------------------
+    # VISUALIZATION
+    # --------------------------------------------------------
+
+    asset_path = (
+        VisualizationAssetGenerator
+        .generate_conflict_graph(
+            graph,
+            selected_cycles
+        )
+    )
+
+    # --------------------------------------------------------
+    # PRUNING INFORMATION
+    # --------------------------------------------------------
+
+    nodes_pruned = max(
+        len(initial_selected)
+        - len(selected_cycles),
+        0
+    )
+
+    # --------------------------------------------------------
+    # RESULT
+    # --------------------------------------------------------
+    #
+    # IMPORTANT:
+    # The five QCentroid benchmark metrics are exposed
+    # directly at the top level of the result.
+    #
+
+    result = {
 
         # ====================================================
-        # GAP DE OPTIMALIDAD
+        # BENCHMARK METRICS
         # ====================================================
 
-        if exact_weight > 0:
+        "total_weight": float(
+            total_weight
+        ),
 
-            optimality_gap = (
-                (exact_weight - final_weight)
-                / exact_weight
-                * 100.0
+        "optimality_gap_percent": float(
+            optimality_gap_percent
+        ),
+
+        "coverage_percent": float(
+            coverage_percent
+        ),
+
+        "execution_time_seconds": float(
+            execution_time_seconds
+        ),
+
+        "total_operating_cost": float(
+            operational["total_operating_cost"]
+        ),
+
+        # ====================================================
+        # SOLUTION
+        # ====================================================
+
+        "selected_cycles": selected_cycles,
+
+        "is_feasible": bool(
+            is_feasible
+        ),
+
+        # ====================================================
+        # OPERATIONAL RESULTS
+        # ====================================================
+
+        "total_passenger_km": float(
+            operational["total_passenger_km"]
+        ),
+
+        "total_empty_km": float(
+            operational["total_empty_km"]
+        ),
+
+        "scheduled_trips": int(
+            scheduled_trips
+        ),
+
+        "covered_trips": int(
+            covered_trips
+        ),
+
+        # ====================================================
+        # EXECUTION INFORMATION
+        # ====================================================
+
+        "backend_used": backend_used,
+
+        "execution_metrics": {
+
+            "execution_time_seconds": float(
+                execution_time_seconds
+            ),
+
+            "final_solution_size": int(
+                len(selected_cycles)
+            ),
+
+            "initial_solution_size": int(
+                len(initial_selected)
+            ),
+
+            "initial_bitstring_min_qubo": (
+                initial_bitstring
+            ),
+
+            "initial_qubo_energy": float(
+                initial_qubo_energy
+            ),
+
+            "penalty": float(
+                penalty
+            ),
+
+            "qaoa_depth": int(
+                qaoa_depth
+            ),
+
+            "shots": int(
+                shots
+            ),
+
+            "job_id": job_id
+        },
+
+        # ====================================================
+        # GROUND TRUTH
+        # ====================================================
+
+        "ground_truth_exact": {
+
+            "selected_cycles": exact_selected,
+
+            "total_weight": float(
+                exact_weight
+            ),
+
+            "optimality_gap_percent": float(
+                optimality_gap_percent
             )
-
-        else:
-
-            optimality_gap = 0.0
+        },
 
         # ====================================================
-        # VISUALIZACIÓN
+        # PRUNING
         # ====================================================
 
-        asset_path = (
-            VisualizationAssetGenerator
-            .generate_conflict_graph_visualization(
-                graph,
-                final_selected,
-                pruned_nodes,
-            )
-        )
+        "nodes_pruned": int(
+            nodes_pruned
+        ),
 
-        assets = (
-            {"conflict_graph_png": asset_path}
-            if asset_path
-            else {}
-        )
+        "pruning_stats": {
+
+            "nodes_pruned_count": int(
+                nodes_pruned
+            ),
+
+            "pruned_nodes_list": []
+        },
 
         # ====================================================
-        # RESPUESTA QCENTROID
+        # ASSETS
         # ====================================================
 
-        response = {
+        "assets": {
 
-            "selected_cycles": final_selected,
-
-            "total_weight": final_weight,
-
-            "coverage_rate": round(
-                coverage_rate,
-                4,
-            ),
-
-            "coverage_percent": round(
-                coverage_rate * 100.0,
-                2,
-            ),
-
-            "covered_trips": len(
-                covered_trips
-            ),
-
-            "scheduled_trips": len(
-                all_trips
-            ),
-
-            "total_empty_km": (
-                total_empty_km
-            ),
-
-            "total_passenger_km": (
-                total_passenger_km
-            ),
-
-            "total_operating_cost": (
-                total_operating_cost
-            ),
-
-            "is_feasible": feasible,
-
-            "nodes_pruned": len(
-                pruned_nodes
-            ),
-
-            # ------------------------------------------------
-            # Referencia exacta
-            # ------------------------------------------------
-
-            "ground_truth_exact": {
-
-                "selected_cycles": (
-                    exact_cycles
-                ),
-
-                "total_weight": (
-                    exact_weight
-                ),
-
-                "optimality_gap_percent": round(
-                    optimality_gap,
-                    2,
-                ),
-            },
-
-            # ------------------------------------------------
-            # Ejecución
-            # ------------------------------------------------
-
-            "execution_metrics": {
-
-                "execution_time_seconds": (
-                    exec_time
-                ),
-
-                "initial_solution_size": (
-                    len(raw_selected)
-                ),
-
-                "final_solution_size": (
-                    len(final_selected)
-                ),
-
-                "initial_bitstring_min_qubo": (
-                    best_bitstring
-                ),
-
-                "initial_qubo_energy": (
-                    best_qubo_energy
-                ),
-
-                "qaoa_depth": (
-                    qaoa_depth
-                ),
-
-                "shots": (
-                    shots
-                ),
-
-                "penalty": (
-                    objective.lambda_penalty
-                ),
-
-                "job_id": (
-                    job_id
-                ),
-            },
-
-            # ------------------------------------------------
-            # Poda
-            # ------------------------------------------------
-
-            "pruning_stats": {
-
-                "nodes_pruned_count": (
-                    len(pruned_nodes)
-                ),
-
-                "pruned_nodes_list": (
-                    pruned_nodes
-                ),
-            },
-
-            # ------------------------------------------------
-            # Backend
-            # ------------------------------------------------
-
-            "backend_used": (
-                backend_info
-            ),
-
-            # ------------------------------------------------
-            # Assets
-            # ------------------------------------------------
-
-            "assets": assets,
+            "conflict_graph_png": asset_path
         }
+    }
 
-        logger.info(
-            "Ejecución completada."
-        )
+    # --------------------------------------------------------
+    # LOG BENCHMARK VALUES
+    # --------------------------------------------------------
 
-        logger.info(
-            "Solución final: %s",
-            final_selected,
-        )
+    logger.info(
+        "Benchmark total_weight = %.4f",
+        result["total_weight"]
+    )
 
-        logger.info(
-            "Peso final: %.4f",
-            final_weight,
-        )
+    logger.info(
+        "Benchmark optimality_gap_percent = %.4f",
+        result["optimality_gap_percent"]
+    )
 
-        logger.info(
-            "Ground Truth: %s",
-            exact_cycles,
-        )
+    logger.info(
+        "Benchmark coverage_percent = %.4f",
+        result["coverage_percent"]
+    )
 
-        logger.info(
-            "Gap de optimalidad: %.2f%%",
-            optimality_gap,
-        )
+    logger.info(
+        "Benchmark execution_time_seconds = %.4f",
+        result["execution_time_seconds"]
+    )
 
-        return response
+    logger.info(
+        "Benchmark total_operating_cost = %.4f",
+        result["total_operating_cost"]
+    )
 
-    except Exception as exc:
+    logger.info(
+        "Selected cycles: %s",
+        selected_cycles
+    )
 
-        logger.exception(
-            "Fallo durante la ejecución del solver."
-        )
+    logger.info(
+        "Execution finished"
+    )
 
-        return {
-            "selected_cycles": [],
-            "total_weight": 0.0,
-            "is_feasible": False,
-            "error": str(exc),
+    return result
+
+
+# ============================================================
+# LOCAL TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    example_input = {
+
+        "nodes": [
+
+            {
+                "id": "C01",
+                "weight": 86,
+                "trips": ["T01", "T02"],
+                "passenger_km": 8200,
+                "empty_km": 80,
+                "operating_cost": 1180
+            },
+
+            {
+                "id": "C02",
+                "weight": 78,
+                "trips": ["T02", "T03"],
+                "passenger_km": 7600,
+                "empty_km": 120,
+                "operating_cost": 1210
+            },
+
+            {
+                "id": "C03",
+                "weight": 91,
+                "trips": ["T03", "T04"],
+                "passenger_km": 9000,
+                "empty_km": 60,
+                "operating_cost": 1160
+            },
+
+            {
+                "id": "C04",
+                "weight": 73,
+                "trips": ["T04", "T05"],
+                "passenger_km": 7100,
+                "empty_km": 150,
+                "operating_cost": 1240
+            },
+
+            {
+                "id": "C05",
+                "weight": 88,
+                "trips": ["T05", "T01"],
+                "passenger_km": 8500,
+                "empty_km": 70,
+                "operating_cost": 1190
+            }
+        ],
+
+        "edges": [
+
+            ["C01", "C02"],
+            ["C02", "C03"],
+            ["C03", "C04"],
+            ["C04", "C05"],
+            ["C05", "C01"]
+        ]
+    }
+
+    result = run(
+        example_input,
+        solver_params={
+            "qaoa_depth": 2,
+            "shots": 2048,
+            "backend": "IQM Resonance (emerald)"
         }
+    )
+
+    print("\nRESULT:")
+    print(result)
