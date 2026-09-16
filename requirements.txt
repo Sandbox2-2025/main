@@ -1,15 +1,4 @@
 # QCentroid Railway Rolling Stock MWIS Solver - Dependencies
 # Railway Rolling Stock Cycle Selection via Maximum Weighted Independent Set Optimization
 
-# Conector de hardware cuántico (IQM Resonance)
-iqm-client[qiskit]>=34.0.4
-
-# Framework cuántico y simulador local
-qiskit>=1.0.0
-qiskit-aer>=0.13.0
-
-# Procesamiento de grafos para el problema MWIS
-networkx>=3.0
-
-# Generación de activos visuales para la pestaña Assets de QCentroid
-matplotlib>=3.7.0
+numpy>=1.26,<3
