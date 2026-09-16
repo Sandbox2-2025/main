@@ -298,7 +298,7 @@ class MWISObjective:
         complement_graph = nx.complement(self.graph)
 
         for node in complement_graph.nodes():
-            complement_graph.nodes[node]["weight"] = (
+            complement_graph.nodes[node]["weight"] = int(
                 self.weights[node]
             )
 
