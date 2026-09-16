@@ -2,50 +2,228 @@
   "nodes": [
     {
       "id": "C01",
-      "weight": 86,
-      "trips": ["T01", "T02"],
+      "weight": 86.0,
+      "trips": [
+        "T01",
+        "T02"
+      ],
       "passenger_km": 8200,
       "empty_km": 80,
       "operating_cost": 1180
     },
     {
       "id": "C02",
-      "weight": 78,
-      "trips": ["T02", "T03"],
+      "weight": 78.0,
+      "trips": [
+        "T02",
+        "T03"
+      ],
       "passenger_km": 7600,
       "empty_km": 120,
       "operating_cost": 1210
     },
     {
       "id": "C03",
-      "weight": 91,
-      "trips": ["T03", "T04"],
+      "weight": 91.0,
+      "trips": [
+        "T03",
+        "T04"
+      ],
       "passenger_km": 9000,
       "empty_km": 60,
       "operating_cost": 1160
     },
     {
       "id": "C04",
-      "weight": 73,
-      "trips": ["T04", "T05"],
+      "weight": 73.0,
+      "trips": [
+        "T04",
+        "T05"
+      ],
       "passenger_km": 7100,
       "empty_km": 150,
       "operating_cost": 1240
     },
     {
       "id": "C05",
-      "weight": 88,
-      "trips": ["T05", "T01"],
+      "weight": 88.0,
+      "trips": [
+        "T05",
+        "T06"
+      ],
       "passenger_km": 8500,
       "empty_km": 70,
       "operating_cost": 1190
+    },
+    {
+      "id": "C06",
+      "weight": 69.0,
+      "trips": [
+        "T06",
+        "T07"
+      ],
+      "passenger_km": 6700,
+      "empty_km": 180,
+      "operating_cost": 1260
+    },
+    {
+      "id": "C07",
+      "weight": 94.0,
+      "trips": [
+        "T07",
+        "T08"
+      ],
+      "passenger_km": 9300,
+      "empty_km": 50,
+      "operating_cost": 1150
+    },
+    {
+      "id": "C08",
+      "weight": 76.0,
+      "trips": [
+        "T08",
+        "T09"
+      ],
+      "passenger_km": 7400,
+      "empty_km": 130,
+      "operating_cost": 1220
+    },
+    {
+      "id": "C09",
+      "weight": 89.0,
+      "trips": [
+        "T09",
+        "T10"
+      ],
+      "passenger_km": 8700,
+      "empty_km": 90,
+      "operating_cost": 1170
+    },
+    {
+      "id": "C10",
+      "weight": 72.0,
+      "trips": [
+        "T01",
+        "T05",
+        "T09"
+      ],
+      "passenger_km": 7000,
+      "empty_km": 210,
+      "operating_cost": 1290
+    },
+    {
+      "id": "C11",
+      "weight": 83.0,
+      "trips": [
+        "T02",
+        "T06",
+        "T10"
+      ],
+      "passenger_km": 8100,
+      "empty_km": 140,
+      "operating_cost": 1230
+    },
+    {
+      "id": "C12",
+      "weight": 97.0,
+      "trips": [
+        "T03",
+        "T07",
+        "T08"
+      ],
+      "passenger_km": 9500,
+      "empty_km": 40,
+      "operating_cost": 1140
     }
   ],
   "edges": [
-    ["C01", "C02"],
-    ["C02", "C03"],
-    ["C03", "C04"],
-    ["C04", "C05"],
-    ["C05", "C01"]
+    [
+      "C01",
+      "C02"
+    ],
+    [
+      "C01",
+      "C10"
+    ],
+    [
+      "C01",
+      "C11"
+    ],
+    [
+      "C02",
+      "C03"
+    ],
+    [
+      "C02",
+      "C11"
+    ],
+    [
+      "C03",
+      "C04"
+    ],
+    [
+      "C03",
+      "C12"
+    ],
+    [
+      "C04",
+      "C05"
+    ],
+    [
+      "C05",
+      "C06"
+    ],
+    [
+      "C05",
+      "C10"
+    ],
+    [
+      "C05",
+      "C11"
+    ],
+    [
+      "C06",
+      "C07"
+    ],
+    [
+      "C06",
+      "C11"
+    ],
+    [
+      "C07",
+      "C08"
+    ],
+    [
+      "C07",
+      "C12"
+    ],
+    [
+      "C08",
+      "C09"
+    ],
+    [
+      "C08",
+      "C12"
+    ],
+    [
+      "C09",
+      "C10"
+    ],
+    [
+      "C09",
+      "C11"
+    ],
+    [
+      "C10",
+      "C11"
+    ],
+    [
+      "C10",
+      "C12"
+    ],
+    [
+      "C11",
+      "C12"
+    ]
   ]
 }
