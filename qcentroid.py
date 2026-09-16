@@ -315,17 +315,19 @@ def build_conflict_graph(input_data: Dict[str, Any]) -> nx.Graph:
             if not isinstance(edge, (list, tuple)) or len(edge) != 2:
                 logger.warning("Arista ignorada (formato inválido): %r", edge)
                 continue
-
-            u, v = edge, edge[6]
-
+    
+            # Asignación explícita del primer y segundo elemento de la arista
+            u = edge
+            v = edge[3]
+    
             if u not in graph or v not in graph:
                 logger.warning("Arista ignorada (nodo inexistente): %s - %s", u, v)
                 continue
-
+    
             if u == v:
                 logger.warning("Autoconflicto ignorado: %s", u)
                 continue
-
+    
             graph.add_edge(u, v)
     else:
         node_list = list(graph.nodes())
