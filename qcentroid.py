@@ -172,15 +172,17 @@ class MWISObjective:
         """Calcula el MWIS exacto mediante Maximum Weight Clique sobre el complemento."""
         complement_graph = nx.complement(self.graph)
 
+        # Convertir obligatoriamente a int para evitar el ValueError de NetworkX
         for node in complement_graph.nodes():
-            complement_graph.nodes[node]["weight"] = self.weights[node]
+            complement_graph.nodes[node]["weight"] = int(round(self.weights[node]))
 
-        clique, weight = nx.max_weight_clique(
+        clique, _ = nx.max_weight_clique(
             complement_graph,
             weight="weight",
         )
 
-        return sorted(clique), float(weight)
+        real_weight = sum(self.weights[node] for node in clique)
+        return sorted(clique), float(real_weight)
 
 
 # ============================================================
@@ -308,14 +310,13 @@ def build_conflict_graph(input_data: Dict[str, Any]) -> nx.Graph:
             operating_cost=operating_cost,
         )
 
-    # Procesamiento correcto de aristas (e y e[1])
     if edges_raw:
         for edge in edges_raw:
             if not isinstance(edge, (list, tuple)) or len(edge) != 2:
                 logger.warning("Arista ignorada (formato inválido): %r", edge)
                 continue
 
-            u, v = edge, edge[1]
+            u, v = edge, edge[6]
 
             if u not in graph or v not in graph:
                 logger.warning("Arista ignorada (nodo inexistente): %s - %s", u, v)
@@ -327,7 +328,6 @@ def build_conflict_graph(input_data: Dict[str, Any]) -> nx.Graph:
 
             graph.add_edge(u, v)
     else:
-        # Generación automática por intersección de viajes programados
         node_list = list(graph.nodes())
         for i in range(len(node_list)):
             for j in range(i + 1, len(node_list)):
@@ -357,7 +357,6 @@ def build_qaoa_circuit(
     cr = ClassicalRegister(n_qubits, "c")
     qc = QuantumCircuit(qr, cr)
 
-    # Estado inicial |+>
     for i in range(n_qubits):
         qc.h(qr[i])
 
@@ -368,7 +367,6 @@ def build_qaoa_circuit(
         gamma = gamma_values[layer]
         beta = beta_values[layer]
 
-        # Términos lineales RZ
         for i, node in enumerate(objective.nodes):
             deg = graph.degree(node)
             h_i = (objective.weights[node] / 2.0) - (
@@ -376,14 +374,12 @@ def build_qaoa_circuit(
             )
             qc.rz(2.0 * gamma * h_i, qr[i])
 
-        # Términos de acoplamiento RZZ
         for u, v in graph.edges():
             i = objective.node_index[u]
             j = objective.node_index[v]
             coupling = objective.lambda_penalty / 4.0
             qc.rzz(2.0 * gamma * coupling, qr[i], qr[j])
 
-        # Mezclador Mixer RX
         for i in range(n_qubits):
             qc.rx(2.0 * beta, qr[i])
 
@@ -480,7 +476,6 @@ def run(
 
     start_time = time.perf_counter()
 
-    # 1. Búsqueda exhaustiva del token de IQM
     iqm_token = (
         solver_params.get("iqm_token")
         or extra_arguments.get("iqm_token")
@@ -497,7 +492,6 @@ def run(
     shots = int(solver_params.get("shots", 2048))
     penalty_param = solver_params.get("penalty")
 
-    # 2. Carga y validación de entrada
     nodes_raw = input_data.get("nodes", [])
     if not nodes_raw:
         raise ValueError("El dataset de entrada debe contener al menos un nodo.")
@@ -509,11 +503,9 @@ def run(
         graph.number_of_edges(),
     )
 
-    # 3. Formulación MWIS
     objective = MWISObjective(graph, penalty_override=penalty_param)
     logger.info("Penalización QUBO calculada: %.4f", objective.lambda_penalty)
 
-    # 4. Cálculo del Ground Truth Clásico Exacto
     exact_selected, exact_weight = objective.solve_exact_ground_truth()
     logger.info(
         "Ground Truth Exacto Clásico: %s | Peso Máximo: %.4f",
@@ -521,7 +513,6 @@ def run(
         exact_weight,
     )
 
-    # 5. Configuración del Backend (IQM Resonance / Aer / Fallback)
     backend = None
     backend_used = "Solución exacta clásica (fallback)"
     job_id = "local"
@@ -539,7 +530,6 @@ def run(
         backend = AerSimulator()
         backend_used = "Qiskit AerSimulator (CPU)"
 
-    # 6. Síntesis y Ejecución QAOA
     if QISKIT_AVAILABLE and backend is not None:
         qc = build_qaoa_circuit(graph, objective, qaoa_depth)
         qc_transpiled = transpile(qc, backend=backend, optimization_level=2)
@@ -555,7 +545,6 @@ def run(
 
         counts = q_job.result().get_counts()
 
-        # Selección por Mínima Energía QUBO
         initial_bitstring, initial_qubo_energy = select_best_qaoa_bitstring(counts, objective)
         initial_selected = bitstring_to_selected_nodes(initial_bitstring, objective)
     else:
@@ -563,12 +552,10 @@ def run(
         initial_qubo_energy = -exact_weight
         initial_selected = exact_selected
 
-    # 7. Reparación por Poda (Pruning)
     selected_cycles = MWISPruner.prune_solution(graph, initial_selected)
     is_feasible = objective.is_feasible(selected_cycles)
     total_weight = objective.solution_weight(selected_cycles)
 
-    # 8. Cálculo del Gap de Optimalidad
     if exact_weight != 0:
         optimality_gap_percent = ((exact_weight - total_weight) / abs(exact_weight)) * 100.0
     else:
@@ -577,43 +564,28 @@ def run(
     if abs(optimality_gap_percent) < 1e-12:
         optimality_gap_percent = 0.0
 
-    # 9. Cobertura y Métricas Operativas
     scheduled_trips, covered_trips, coverage_percent = calculate_coverage(nodes_raw, selected_cycles)
     operational = calculate_operational_metrics(nodes_raw, selected_cycles)
     execution_time_seconds = time.perf_counter() - start_time
 
-    # 10. Generación de Activos Gráficos
     asset_path = VisualizationAssetGenerator.generate_conflict_graph(graph, selected_cycles)
     nodes_pruned = max(len(initial_selected) - len(selected_cycles), 0)
 
-    # 11. Estructura de Respuesta Oficial de QCentroid (Métricas en Raíz)
     result = {
-        # ====================================================
-        # METRICAS DE BENCHMARK (Nivel Raíz)
-        # ====================================================
         "total_weight": float(total_weight),
         "optimality_gap_percent": float(optimality_gap_percent),
         "coverage_percent": float(coverage_percent),
         "execution_time_seconds": float(execution_time_seconds),
         "total_operating_cost": float(operational["total_operating_cost"]),
 
-        # ====================================================
-        # RESULTADO DE LA SOLUCIÓN
-        # ====================================================
         "selected_cycles": selected_cycles,
         "is_feasible": bool(is_feasible),
 
-        # ====================================================
-        # RESULTADOS OPERATIVOS
-        # ====================================================
         "total_passenger_km": float(operational["total_passenger_km"]),
         "total_empty_km": float(operational["total_empty_km"]),
         "scheduled_trips": int(scheduled_trips),
         "covered_trips": int(covered_trips),
 
-        # ====================================================
-        # INFORMACIÓN DE EJECUCIÓN Y TRAZABILIDAD
-        # ====================================================
         "backend_used": backend_used,
         "execution_metrics": {
             "execution_time_seconds": float(execution_time_seconds),
@@ -641,80 +613,5 @@ def run(
         },
     }
 
-    logger.info("Benchmark total_weight = %.4f", result["total_weight"])
-    logger.info("Benchmark optimality_gap_percent = %.4f", result["optimality_gap_percent"])
-    logger.info("Benchmark coverage_percent = %.4f", result["coverage_percent"])
-    logger.info("Benchmark execution_time_seconds = %.4f", result["execution_time_seconds"])
-    logger.info("Benchmark total_operating_cost = %.4f", result["total_operating_cost"])
     logger.info("Ejecución finalizada con éxito. Ciclos seleccionados: %s", selected_cycles)
-
     return result
-
-
-# ============================================================
-# BLOQUE DE PRUEBA LOCAL DE ESCRITORIO
-# ============================================================
-if __name__ == "__main__":
-    example_input = {
-        "nodes": [
-            {
-                "id": "C01",
-                "weight": 86,
-                "trips": ["T01", "T02"],
-                "passenger_km": 8200,
-                "empty_km": 80,
-                "operating_cost": 1180,
-            },
-            {
-                "id": "C02",
-                "weight": 78,
-                "trips": ["T02", "T03"],
-                "passenger_km": 7600,
-                "empty_km": 120,
-                "operating_cost": 1210,
-            },
-            {
-                "id": "C03",
-                "weight": 91,
-                "trips": ["T03", "T04"],
-                "passenger_km": 9000,
-                "empty_km": 60,
-                "operating_cost": 1160,
-            },
-            {
-                "id": "C04",
-                "weight": 73,
-                "trips": ["T04", "T05"],
-                "passenger_km": 7100,
-                "empty_km": 150,
-                "operating_cost": 1240,
-            },
-            {
-                "id": "C05",
-                "weight": 88,
-                "trips": ["T05", "T01"],
-                "passenger_km": 8500,
-                "empty_km": 70,
-                "operating_cost": 1190,
-            },
-        ],
-        "edges": [
-            ["C01", "C02"],
-            ["C02", "C03"],
-            ["C03", "C04"],
-            ["C04", "C05"],
-            ["C05", "C01"],
-        ],
-    }
-
-    local_result = run(
-        example_input,
-        solver_params={
-            "qaoa_depth": 2,
-            "shots": 2048,
-        },
-    )
-
-    print("\n=================== RESULTADO LOCAL ===================")
-    import json
-    print(json.dumps(local_result, indent=2))
