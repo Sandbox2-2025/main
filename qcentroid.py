@@ -1,18 +1,136 @@
+"""
+===============================================================
+QCentroid PoC
+Railway Rolling Stock Cycle Selection
+MWIS + QUBO + QAOA + IQM Resonance
+===============================================================
+
+OBJETIVO
+--------
+Seleccionar un conjunto de ciclos de material rodante que:
+
+    1. No tengan conflictos entre sí.
+    2. Maximicen el valor total de los ciclos seleccionados.
+
+El problema se formula como:
+
+    Maximum Weighted Independent Set (MWIS)
+
+Cada nodo representa un ciclo ferroviario.
+Cada arista representa un conflicto entre dos ciclos.
+
+La función QUBO utilizada es:
+
+    H(x) = - sum(w_i * x_i)
+           + lambda * sum(x_i * x_j)
+
+donde:
+
+    x_i = 1 -> ciclo seleccionado
+    x_i = 0 -> ciclo no seleccionado
+
+El primer término maximiza el peso.
+
+El segundo término penaliza la selección simultánea
+de ciclos que presentan conflicto.
+
+ARQUITECTURA DE EJECUCIÓN
+-------------------------
+
+    Dataset JSON
+          |
+          v
+    Validación de datos
+          |
+          v
+    Grafo de conflictos
+          |
+          v
+    Definición MWIS
+          |
+          v
+    Construcción QUBO
+          |
+          v
+    Circuito QAOA
+          |
+          v
+    IQM Resonance / Emerald
+          |
+          v
+    Bitstrings
+          |
+          v
+    Evaluación QUBO
+          |
+          v
+    Reparación determinista
+          |
+          v
+    Validación contra solución exacta
+          |
+          v
+    Métricas + assets
+          |
+          v
+    Resultado QCentroid
+
+IMPORTANTE
+----------
+QCentroid proporciona mediante `extra_arguments`:
+
+    iqm_token
+    quantum_computer
+    shots
+    qaoa_depth
+
+Por tanto, el solver NO contiene credenciales.
+
+Si `quantum_computer` está configurado como `emerald`,
+el solver ejecuta obligatoriamente contra IQM.
+
+No se realiza fallback silencioso a AerSimulator.
+Esto es deliberado: un benchmark hardware debe poder
+distinguir inequívocamente una ejecución real de IQM
+de una simulación clásica.
+"""
+
+# ============================================================
+# PASO 1. IMPORTACIONES
+# ============================================================
+
+import json
+import logging
+import math
 import os
 import time
-import logging
-from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+
+# ------------------------------------------------------------
+# Matplotlib
+# ------------------------------------------------------------
+# QCentroid se ejecuta en un entorno sin interfaz gráfica.
+# Por eso utilizamos el backend no interactivo "Agg".
+# ------------------------------------------------------------
 
 import matplotlib
+
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+
+
+# ------------------------------------------------------------
+# NetworkX
+# ------------------------------------------------------------
+
 import networkx as nx
 
 
-# ============================================================
-# OPTIONAL DEPENDENCIES
-# ============================================================
+# ------------------------------------------------------------
+# Qiskit
+# ------------------------------------------------------------
 
 try:
     from qiskit import QuantumCircuit, transpile
@@ -20,10 +138,24 @@ except ImportError:
     QuantumCircuit = None
     transpile = None
 
+
+# ------------------------------------------------------------
+# Qiskit Aer
+# ------------------------------------------------------------
+# Se mantiene disponible únicamente como herramienta técnica
+# opcional si el usuario solicita explícitamente use_iqm=False.
+# NO se utiliza como fallback automático.
+# ------------------------------------------------------------
+
 try:
     from qiskit_aer import AerSimulator
 except ImportError:
     AerSimulator = None
+
+
+# ------------------------------------------------------------
+# IQM
+# ------------------------------------------------------------
 
 try:
     from iqm.qiskit_iqm import IQMProvider
@@ -32,647 +164,775 @@ except ImportError:
 
 
 # ============================================================
-# LOGGING
+# PASO 2. CONFIGURACIÓN DE LOGGING
 # ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# URL SANITIZER
+# PASO 3. SANITIZACIÓN BÁSICA
 # ============================================================
 
 class URLSanitizer:
     """
-    Keeps URL-related configuration out of logs/results when possible.
+    Pequeña utilidad para normalizar la URL del servidor IQM.
+
+    QCentroid puede proporcionar una URL de dispositivo o una
+    URL de servidor dependiendo de la configuración.
+
+    Ejemplos:
+
+        https://cocos.resonance.meetiqm.com
+        https://cocos.resonance.meetiqm.com/
+        https://cocos.resonance.meetiqm.com/emerald
     """
 
     @staticmethod
-    def sanitize(url):
-        if not url:
-            return None
+    def normalize_iqm_url(url: str) -> str:
+        """
+        Normaliza la URL IQM para su utilización por IQMProvider.
 
-        return str(url).rstrip("/")
+        Si la URL termina en el nombre del ordenador cuántico,
+        se elimina dicho componente.
+        """
+
+        if not url:
+            return url
+
+        url = str(url).strip().rstrip("/")
+
+        # Si QCentroid entrega directamente:
+        # https://.../emerald
+        #
+        # IQMProvider normalmente necesita el endpoint del servidor.
+        parts = url.split("/")
+
+        if parts[-1].lower() in {
+            "emerald",
+            "garnet",
+            "deneb",
+            "adonis",
+        }:
+            url = "/".join(parts[:-1])
+
+        return url
 
 
 # ============================================================
-# MWIS OBJECTIVE
+# PASO 4. OBJETIVO MWIS
 # ============================================================
 
 class MWISObjective:
     """
-    Maximum Weighted Independent Set objective.
+    Define el objetivo de optimización.
 
-    The explicit 'weight' field is the optimization objective.
+    Si cada nodo contiene explícitamente:
 
-    If weight is not supplied, a fallback objective is calculated as:
+        weight
+
+    se utiliza ese valor como objetivo principal.
+
+    Si no existe weight, se utiliza una función de fallback:
 
         2 * passenger_km - empty_km
 
-    passenger_km, empty_km and operating_cost are operational
-    metrics and are not included in the optimization objective
-    when an explicit weight is supplied.
+    passenger_km, empty_km y operating_cost son métricas
+    operacionales. No forman parte del objetivo cuando
+    existe un weight explícito.
     """
 
-    def __init__(self, nodes, edges):
-        self.nodes = nodes
-        self.edges = edges
-
-        self.graph = nx.Graph()
+    def __init__(self, graph: nx.Graph):
+        self.graph = graph
 
         self.weights = {}
-        self.node_data = {}
 
-        for node in nodes:
-            node_id = node["id"]
+        for node, data in graph.nodes(data=True):
 
-            self.graph.add_node(node_id)
+            # ------------------------------------------------
+            # OBJETIVO EXPLÍCITO
+            # ------------------------------------------------
 
-            if "weight" in node:
-                weight = float(node["weight"])
+            if "weight" in data:
+                weight = float(data["weight"])
+
+            # ------------------------------------------------
+            # OBJETIVO DE FALLBACK
+            # ------------------------------------------------
+
             else:
+                passenger_km = float(data.get("passenger_km", 0.0))
+                empty_km = float(data.get("empty_km", 0.0))
+
                 weight = (
-                    2.0 * float(node.get("passenger_km", 0.0))
-                    - float(node.get("empty_km", 0.0))
+                    2.0 * passenger_km
+                    - empty_km
                 )
 
-            self.weights[node_id] = weight
-            self.node_data[node_id] = node
+            self.weights[node] = weight
 
-        for edge in edges:
-            if not isinstance(edge, (list, tuple)) or len(edge) != 2:
-                raise ValueError(
-                    f"Invalid edge format: {edge}. "
-                    "Edges must contain exactly two node IDs."
-                )
+    def total_weight(self, selected_nodes: List[str]) -> float:
+        """
+        Calcula el peso total de una solución.
+        """
 
-            u = edge[0]
-            v = edge[1]
-
-            if u not in self.graph.nodes:
-                raise ValueError(
-                    f"Edge references unknown node: {u}"
-                )
-
-            if v not in self.graph.nodes:
-                raise ValueError(
-                    f"Edge references unknown node: {v}"
-                )
-
-            self.graph.add_edge(u, v)
-
-    def objective_value(self, selected_nodes):
-        return float(
-            sum(
-                self.weights[node]
-                for node in selected_nodes
-            )
+        return sum(
+            self.weights[node]
+            for node in selected_nodes
         )
-
-    def qubo_energy(self, selected_nodes, penalty):
-        """
-        QUBO:
-
-            H(x) =
-                - sum_i w_i x_i
-                + penalty * sum_(i,j) x_i x_j
-
-        A selected conflict therefore incurs the penalty.
-        """
-
-        selected = set(selected_nodes)
-
-        energy = -self.objective_value(selected)
-
-        for u, v in self.graph.edges():
-            if u in selected and v in selected:
-                energy += penalty
-
-        return float(energy)
-
-    def exact_solution(self):
-        """
-        Exact MWIS through maximum-weight clique on the
-        complement graph.
-
-        NetworkX max_weight_clique requires integer node weights
-        in the installed NetworkX version, therefore the weights
-        are converted to integers for the exact reference.
-
-        The original floating-point weights are then used to
-        calculate the final objective value.
-        """
-
-        complement = nx.complement(self.graph)
-
-        for node in complement.nodes:
-            complement.nodes[node]["weight"] = int(
-                round(self.weights[node])
-            )
-
-        clique, _ = nx.algorithms.clique.max_weight_clique(
-            complement,
-            weight="weight",
-        )
-
-        selected_nodes = list(clique)
-
-        total_weight = self.objective_value(
-            selected_nodes
-        )
-
-        return selected_nodes, float(total_weight)
 
 
 # ============================================================
-# MWIS PRUNER / REPAIR
+# PASO 5. CONSTRUCCIÓN DEL GRAFO
 # ============================================================
 
-class MWISPruner:
+def build_conflict_graph(input_data: Dict[str, Any]) -> nx.Graph:
     """
-    Deterministic repair step.
+    Construye el grafo de conflictos a partir del JSON.
 
-    If a measured bitstring contains conflicts, the selected
-    nodes are repaired by keeping nodes according to:
+    Input:
 
-        weight / (degree + 1)
-
-    This is only a feasibility repair heuristic.
-    """
-
-    def __init__(self, graph, weights):
-        self.graph = graph
-        self.weights = weights
-
-    def prune_solution(self, selected_nodes):
-        selected = set(selected_nodes)
-        pruned_nodes = []
-
-        while True:
-            conflicts = []
-
-            for u, v in self.graph.edges():
-                if u in selected and v in selected:
-                    conflicts.append((u, v))
-
-            if not conflicts:
-                break
-
-            conflicting_nodes = set()
-
-            for u, v in conflicts:
-                conflicting_nodes.add(u)
-                conflicting_nodes.add(v)
-
-            ranked = sorted(
-                conflicting_nodes,
-                key=lambda node: (
-                    self.weights[node]
-                    / (self.graph.degree(node) + 1)
-                ),
-                reverse=True,
-            )
-
-            keep = ranked[0]
-
-            for node in conflicting_nodes:
-                if node != keep:
-                    selected.discard(node)
-                    pruned_nodes.append(node)
-
-        return list(selected), pruned_nodes
-
-
-# ============================================================
-# GRAPH VISUALIZATION
-# ============================================================
-
-class VisualizationAssetGenerator:
-
-    @staticmethod
-    def generate(graph, weights, selected_nodes):
-        output_dir = Path("additional_output")
-        output_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        output_path = (
-            output_dir / "conflict_graph.png"
-        )
-
-        plt.figure(
-            figsize=(9, 7),
-            dpi=150,
-        )
-
-        positions = nx.spring_layout(
-            graph,
-            seed=42,
-        )
-
-        node_colors = []
-
-        selected_set = set(selected_nodes)
-
-        for node in graph.nodes:
-            if node in selected_set:
-                node_colors.append("green")
-            else:
-                node_colors.append("lightgray")
-
-        nx.draw_networkx_edges(
-            graph,
-            positions,
-            alpha=0.5,
-        )
-
-        nx.draw_networkx_nodes(
-            graph,
-            positions,
-            node_color=node_colors,
-            node_size=1600,
-            edgecolors="black",
-        )
-
-        labels = {
-            node: f"{node}\nW={weights[node]:.0f}"
-            for node in graph.nodes
+        {
+            "nodes": [...],
+            "edges": [...]
         }
 
-        nx.draw_networkx_labels(
-            graph,
-            positions,
-            labels=labels,
-            font_size=9,
+    Cada nodo representa un ciclo.
+
+    Cada arista:
+
+        [C01, C02]
+
+    significa que C01 y C02 no pueden seleccionarse
+    simultáneamente.
+    """
+
+    graph = nx.Graph()
+
+    nodes = input_data.get("nodes", [])
+    edges = input_data.get("edges", [])
+
+    # --------------------------------------------------------
+    # Añadir nodos
+    # --------------------------------------------------------
+
+    for node_data in nodes:
+
+        if not isinstance(node_data, dict):
+            raise ValueError(
+                "Cada elemento de 'nodes' debe ser un objeto."
+            )
+
+        if "id" not in node_data:
+            raise ValueError(
+                "Cada nodo debe contener un campo 'id'."
+            )
+
+        node_id = str(node_data["id"])
+
+        graph.add_node(
+            node_id,
+            **node_data
         )
 
-        plt.title(
-            "Railway Rolling Stock Cycle Conflict Graph"
-        )
+    # --------------------------------------------------------
+    # Añadir aristas
+    # --------------------------------------------------------
 
-        plt.axis("off")
+    for edge in edges:
 
-        plt.savefig(
-            output_path,
-            bbox_inches="tight",
-        )
+        if not isinstance(edge, (list, tuple)):
+            raise ValueError(
+                "Cada arista debe ser una lista de dos nodos."
+            )
 
-        plt.close()
+        if len(edge) != 2:
+            raise ValueError(
+                f"Arista inválida: {edge}. "
+                "Debe contener exactamente dos nodos."
+            )
 
-        logger.info(
-            "Visualización guardada en %s",
-            output_path,
-        )
+        u = str(edge[0])
+        v = str(edge[1])
 
-        return {
-            "conflict_graph_png": str(output_path)
-        }
+        if u not in graph:
+            raise ValueError(
+                f"La arista referencia un nodo inexistente: {u}"
+            )
+
+        if v not in graph:
+            raise ValueError(
+                f"La arista referencia un nodo inexistente: {v}"
+            )
+
+        graph.add_edge(u, v)
+
+    return graph
 
 
 # ============================================================
-# QAOA CIRCUIT
+# PASO 6. CONSTRUCCIÓN DEL QUBO
+# ============================================================
+
+def calculate_penalty(weights: Dict[str, float]) -> float:
+    """
+    Calcula el parámetro lambda del QUBO.
+
+    Utilizamos:
+
+        lambda = 4 * max(weight)
+
+    Esto garantiza una penalización suficientemente grande
+    respecto al beneficio individual de seleccionar un nodo.
+
+    Para el dataset de validación:
+
+        max(weight) = 91
+
+        lambda = 364
+    """
+
+    if not weights:
+        return 1.0
+
+    max_weight = max(
+        abs(float(weight))
+        for weight in weights.values()
+    )
+
+    return max(
+        1.0,
+        4.0 * max_weight
+    )
+
+
+def qubo_energy(
+    graph: nx.Graph,
+    weights: Dict[str, float],
+    selected_nodes: List[str],
+    penalty: float,
+) -> float:
+    """
+    Evalúa directamente la energía QUBO de una solución.
+
+        H(x) =
+            - sum(weight_i * x_i)
+            + lambda * sum(x_i*x_j)
+
+    Una solución independiente no tiene términos de penalización.
+
+    Por tanto, para una solución factible:
+
+        H(x) = - total_weight
+    """
+
+    selected = set(selected_nodes)
+
+    energy = 0.0
+
+    # --------------------------------------------------------
+    # Término objetivo
+    # --------------------------------------------------------
+
+    for node in graph.nodes:
+
+        if node in selected:
+            energy -= weights[node]
+
+    # --------------------------------------------------------
+    # Término de penalización
+    # --------------------------------------------------------
+
+    for u, v in graph.edges:
+
+        if u in selected and v in selected:
+            energy += penalty
+
+    return float(energy)
+
+
+# ============================================================
+# PASO 7. CONSTRUCCIÓN DEL CIRCUITO QAOA
 # ============================================================
 
 def build_qaoa_circuit(
-    objective,
-    penalty,
-    qaoa_depth=2,
-    gamma=0.2,
-    beta=0.5,
-):
+    graph: nx.Graph,
+    weights: Dict[str, float],
+    penalty: float,
+    qaoa_depth: int,
+) -> QuantumCircuit:
     """
-    Build a QAOA circuit from the MWIS QUBO.
+    Construye un circuito QAOA básico.
 
-    QUBO:
+    Para cada qubit:
 
-        H = -sum(w_i x_i)
-            + penalty * sum(x_i x_j)
+        qubit i <-> nodo i
 
-    Using:
+    Inicialización:
+        |+> para todos los qubits.
 
-        x_i = (1 - Z_i) / 2
+    Cada capa QAOA contiene:
 
-    the QUBO is transformed into:
+        1. Cost unitary
+        2. Mixer unitary
 
-        H = constant
-            + sum(h_i Z_i)
-            + sum(J_ij Z_i Z_j)
+    NOTA
+    ----
+    Los parámetros gamma y beta son actualmente valores
+    heurísticos/fijados para el PoC.
 
-    The constant can be ignored during QAOA because it does
-    not affect the argmin.
-
-    The circuit uses:
-
-        RZ(2 * gamma * h_i)
-        RZZ(2 * gamma * J_ij)
-        RX(2 * beta)
-
-    for each QAOA layer.
+    No se pretende demostrar que sean parámetros variacionales
+    óptimos para cualquier instancia.
     """
 
     if QuantumCircuit is None:
         raise RuntimeError(
-            "Qiskit is not installed."
+            "Qiskit no está disponible en el entorno de ejecución."
         )
 
-    nodes = list(objective.graph.nodes)
-    n_qubits = len(nodes)
+    qaoa_depth = max(
+        1,
+        int(qaoa_depth)
+    )
 
-    index = {
-        node: i
-        for i, node in enumerate(nodes)
-    }
+    nodes = list(graph.nodes)
+
+    n_qubits = len(nodes)
 
     circuit = QuantumCircuit(
         n_qubits,
-        n_qubits,
+        n_qubits
     )
 
-    # Initial |+> state.
+    # --------------------------------------------------------
+    # Estado inicial |+>
+    # --------------------------------------------------------
+
     for qubit in range(n_qubits):
         circuit.h(qubit)
 
-    # QUBO -> Ising coefficients.
-    h = {
-        node: objective.weights[node] / 2.0
-        for node in nodes
+    # --------------------------------------------------------
+    # Parámetros heurísticos
+    # --------------------------------------------------------
+
+    gamma = 0.15
+    beta = 0.20
+
+    node_to_qubit = {
+        node: index
+        for index, node in enumerate(nodes)
     }
 
-    j = {}
-
-    for u, v in objective.graph.edges():
-
-        # x_u x_v =
-        # 1/4 (1 - Z_u - Z_v + Z_u Z_v)
-
-        h[u] -= penalty / 4.0
-        h[v] -= penalty / 4.0
-
-        j[(u, v)] = penalty / 4.0
+    # --------------------------------------------------------
+    # Capas QAOA
+    # --------------------------------------------------------
 
     for _ in range(qaoa_depth):
 
-        # Cost Hamiltonian: single-qubit Z terms.
+        # ====================================================
+        # Cost unitary
+        # ====================================================
+
+        # Objetivo:
+        #
+        #     - weight_i * x_i
+        #
+        # Para este PoC utilizamos RZ como implementación
+        # sencilla del término diagonal.
+
         for node in nodes:
-            qubit = index[node]
+
+            qubit = node_to_qubit[node]
+
+            angle = (
+                2.0
+                * gamma
+                * weights[node]
+            )
 
             circuit.rz(
-                2.0 * gamma * h[node],
-                qubit,
+                angle,
+                qubit
             )
 
-        # Cost Hamiltonian: ZZ terms.
-        for (u, v), coefficient in j.items():
+        # ----------------------------------------------------
+        # Penalización por conflictos
+        # ----------------------------------------------------
 
-            circuit.rzz(
-                2.0 * gamma * coefficient,
-                index[u],
-                index[v],
+        for u, v in graph.edges:
+
+            qubit_u = node_to_qubit[u]
+            qubit_v = node_to_qubit[v]
+
+            # Implementación de una interacción ZZ.
+            #
+            # CNOT -> RZ -> CNOT
+
+            circuit.cx(
+                qubit_u,
+                qubit_v
             )
 
-        # Mixer Hamiltonian.
+            circuit.rz(
+                2.0 * gamma * penalty,
+                qubit_v
+            )
+
+            circuit.cx(
+                qubit_u,
+                qubit_v
+            )
+
+        # ====================================================
+        # Mixer unitary
+        # ====================================================
+
         for qubit in range(n_qubits):
+
             circuit.rx(
                 2.0 * beta,
-                qubit,
+                qubit
             )
+
+    # --------------------------------------------------------
+    # Medición
+    # --------------------------------------------------------
 
     circuit.measure(
         range(n_qubits),
-        range(n_qubits),
+        range(n_qubits)
     )
 
     return circuit
 
 
 # ============================================================
-# BITSTRING UTILITIES
-# ============================================================
-
-def normalize_bitstring(bitstring, n_qubits):
-    """
-    Normalize Qiskit/IQM bitstring representation.
-    """
-
-    bitstring = str(bitstring).replace(
-        " ",
-        "",
-    )
-
-    if len(bitstring) < n_qubits:
-        bitstring = bitstring.zfill(n_qubits)
-
-    if len(bitstring) > n_qubits:
-        bitstring = bitstring[-n_qubits:]
-
-    return bitstring
-
-
-def bitstring_to_selected_nodes(
-    bitstring,
-    nodes,
-):
-    """
-    Convert measured bitstring to selected MWIS nodes.
-
-    Qiskit classical-bit strings are conventionally displayed
-    with the highest-index classical bit on the left.
-
-    Therefore bitstring position [::-1] is mapped to the
-    logical node order.
-    """
-
-    bitstring = normalize_bitstring(
-        bitstring,
-        len(nodes),
-    )
-
-    bits = bitstring[::-1]
-
-    selected = []
-
-    for i, bit in enumerate(bits):
-
-        if bit == "1":
-            selected.append(nodes[i])
-
-    return selected
-
-
-# ============================================================
-# SELECT BEST QAOA BITSTRING
-# ============================================================
-
-def select_best_qaoa_bitstring(
-    counts,
-    objective,
-    penalty,
-):
-    """
-    Select the measured bitstring with the lowest QUBO energy.
-
-    IMPORTANT:
-
-    We do NOT select the most frequent bitstring.
-
-    QAOA is an optimization algorithm, so the measured samples
-    are evaluated against the actual QUBO objective.
-
-    Tie-breaker:
-        if several bitstrings have the same energy, choose the
-        one with the highest number of shots.
-    """
-
-    nodes = list(objective.graph.nodes)
-
-    candidates = []
-
-    for bitstring, shots in counts.items():
-
-        selected = bitstring_to_selected_nodes(
-            bitstring,
-            nodes,
-        )
-
-        energy = objective.qubo_energy(
-            selected,
-            penalty,
-        )
-
-        candidates.append(
-            (
-                float(energy),
-                -int(shots),
-                bitstring,
-                selected,
-                int(shots),
-            )
-        )
-
-    if not candidates:
-        raise RuntimeError(
-            "QAOA returned no measurement counts."
-        )
-
-    best = min(candidates)
-
-    return {
-        "bitstring": best[2],
-        "selected_nodes": best[3],
-        "qubo_energy": best[0],
-        "shots": best[4],
-    }
-
-
-# ============================================================
-# QAOA EXECUTION
+# PASO 8. EJECUCIÓN CUÁNTICA
 # ============================================================
 
 def execute_qaoa(
-    circuit,
-    shots,
-    extra_arguments,
-):
+    circuit: QuantumCircuit,
+    extra_arguments: Dict[str, Any],
+) -> Tuple[Dict[str, int], str, Any]:
     """
-    Execute the QAOA circuit.
+    Ejecuta el circuito QAOA.
 
-    Preferred backend:
-        IQM Resonance
+    FUENTE DE CONFIGURACIÓN
+    -----------------------
 
-    Fallback:
-        local Aer simulator.
+    QCentroid entrega:
 
-    IQM configuration is taken from environment variables:
+        extra_arguments["iqm_token"]
+        extra_arguments["quantum_computer"]
+        extra_arguments["shots"]
 
-        IQM_TOKEN
-        IQM_SERVER_URL
-        IQM_QUANTUM_COMPUTER
+    No se utiliza un token embebido en el código.
 
-    Example:
+    BACKEND
+    -------
 
-        IQM_SERVER_URL=https://resonance.iqm.tech/
-        IQM_QUANTUM_COMPUTER=emerald
+    Si use_iqm=True, se utiliza obligatoriamente IQM.
 
-    The token must NOT be embedded in source code.
+    Por defecto:
+
+        use_iqm = True
+
+    Si IQM no está disponible o la autenticación falla,
+    se genera una excepción.
+
+    Esto es intencionado.
+
+    No queremos que un benchmark configurado para hardware
+    real termine accidentalmente ejecutándose en AerSimulator.
     """
+
+    # ========================================================
+    # 8.1. Leer parámetros entregados por QCentroid
+    # ========================================================
+
+    shots = int(
+        extra_arguments.get(
+            "shots",
+            2048
+        )
+    )
+
+    quantum_computer = str(
+        extra_arguments.get(
+            "quantum_computer",
+            "emerald"
+        )
+    )
 
     use_iqm = bool(
         extra_arguments.get(
             "use_iqm",
-            True,
+            True
         )
     )
 
-    iqm_url = (
-        extra_arguments.get("iqm_server_url")
-        or os.getenv("IQM_SERVER_URL")
+    # ========================================================
+    # 8.2. Token IQM
+    # ========================================================
+
+    # IMPORTANTE:
+    #
+    # QCentroid ya entrega el token mediante:
+    #
+    #     extra_arguments["iqm_token"]
+    #
+    # No se imprime nunca el valor.
+
+    iqm_token = extra_arguments.get(
+        "iqm_token"
     )
 
-    quantum_computer = (
-        extra_arguments.get("quantum_computer")
-        or os.getenv(
-            "IQM_QUANTUM_COMPUTER",
-            "emerald",
-        )
-    )
-
-    iqm_token = os.getenv("IQM_TOKEN")
-
-    # --------------------------------------------------------
-    # IQM Resonance
-    # --------------------------------------------------------
-
-    if (
-        use_iqm
-        and IQMProvider is not None
-        and iqm_url
-        and iqm_token
-    ):
+    if use_iqm:
 
         logger.info(
-            "Ejecutando QAOA en IQM Resonance (%s)",
-            quantum_computer,
+            "QAOA backend requested: IQM"
         )
 
-        provider = IQMProvider(
-            iqm_url,
-            quantum_computer=quantum_computer,
-            token=iqm_token,
+        logger.info(
+            "IQM quantum computer: %s",
+            quantum_computer
         )
 
-        backend = provider.get_backend()
+        logger.info(
+            "QAOA shots: %d",
+            shots
+        )
 
-        if transpile is None:
+        # ====================================================
+        # 8.3. Comprobar SDK IQM
+        # ====================================================
+
+        if IQMProvider is None:
+
             raise RuntimeError(
-                "Qiskit transpile is not available."
+                "IQMProvider no está disponible. "
+                "El entorno QCentroid debe tener instalado "
+                "qiskit-iqm."
             )
 
-        transpiled_circuit = transpile(
-            circuit,
-            backend=backend,
+        # ====================================================
+        # 8.4. Comprobar credencial
+        # ====================================================
+
+        if not iqm_token:
+
+            raise RuntimeError(
+                "QCentroid no ha proporcionado 'iqm_token' "
+                "en extra_arguments. "
+                "No se realizará fallback a AerSimulator."
+            )
+
+        # ====================================================
+        # 8.5. Resolver servidor IQM
+        # ========================================================
+
+        #
+        # QCentroid puede proporcionar la URL mediante:
+        #
+        #   iqm_server_url
+        #   iqm_url
+        #
+        # También permitimos variable de entorno como respaldo
+        # técnico.
+        #
+
+        iqm_url = (
+            extra_arguments.get("iqm_server_url")
+            or extra_arguments.get("iqm_url")
+            or os.getenv("IQM_SERVER_URL")
         )
 
-        job = backend.run(
-            transpiled_circuit,
-            shots=shots,
+        # ----------------------------------------------------
+        # En el entorno Resonance utilizado por este PoC,
+        # si QCentroid no proporciona explícitamente el endpoint,
+        # utilizamos el endpoint público de Resonance.
+        #
+        # El ordenador cuántico concreto sigue siendo controlado
+        # por `quantum_computer`.
+        # ----------------------------------------------------
+
+        if not iqm_url:
+
+            iqm_url = (
+                "https://cocos.resonance.meetiqm.com"
+            )
+
+        iqm_url = (
+            URLSanitizer
+            .normalize_iqm_url(iqm_url)
         )
 
-        result = job.result()
+        logger.info(
+            "IQM server endpoint: %s",
+            iqm_url
+        )
 
-        counts = result.get_counts()
+        # ====================================================
+        # 8.6. Crear Provider IQM
+        # ====================================================
+
+        try:
+
+            provider = IQMProvider(
+                iqm_url,
+                quantum_computer=quantum_computer,
+                token=iqm_token,
+            )
+
+        except TypeError:
+
+            # ------------------------------------------------
+            # Compatibilidad con versiones del SDK que puedan
+            # manejar la autenticación de forma diferente.
+            # ------------------------------------------------
+
+            try:
+
+                provider = IQMProvider(
+                    iqm_url,
+                    quantum_computer=quantum_computer,
+                    token=iqm_token,
+                )
+
+            except Exception as exc:
+
+                raise RuntimeError(
+                    "No se pudo inicializar IQMProvider: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "No se pudo inicializar IQMProvider: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        # ====================================================
+        # 8.7. Obtener backend real
+        # ====================================================
+
+        try:
+
+            backend = provider.get_backend()
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "No se pudo obtener el backend IQM. "
+                f"Quantum computer solicitado: "
+                f"{quantum_computer}. "
+                f"Detalle: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        logger.info(
+            "IQM backend successfully obtained: %s",
+            backend
+        )
+
+        # ====================================================
+        # 8.8. Transpilación para IQM
+        # ====================================================
+
+        try:
+
+            transpiled_circuit = transpile(
+                circuit,
+                backend=backend
+            )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "Error durante la transpilación del circuito "
+                "para IQM: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        logger.info(
+            "Circuit transpiled successfully for IQM."
+        )
+
+        # ====================================================
+        # 8.9. Envío a hardware
+        # ====================================================
+
+        try:
+
+            job = backend.run(
+                transpiled_circuit,
+                shots=shots
+            )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "Error enviando el circuito al backend IQM. "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        logger.info(
+            "QAOA job submitted to IQM."
+        )
+
+        # ====================================================
+        # 8.10. Esperar resultado
+        # ====================================================
+
+        try:
+
+            result = job.result()
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "Error obteniendo el resultado del job IQM. "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        # ====================================================
+        # 8.11. Obtener bitstrings
+        # ====================================================
+
+        try:
+
+            counts = result.get_counts()
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "No se pudieron obtener los counts del resultado "
+                "IQM: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        # ====================================================
+        # 8.12. Obtener Job ID
+        # ====================================================
 
         job_id = None
 
         try:
+
             job_id = job.job_id()
+
         except Exception:
-            pass
+
+            try:
+                job_id = job.id()
+
+            except Exception:
+                job_id = None
+
+        logger.info(
+            "IQM job completed. Job ID: %s",
+            job_id
+        )
 
         return (
             counts,
@@ -680,567 +940,1073 @@ def execute_qaoa(
             job_id,
         )
 
-    # --------------------------------------------------------
-    # Local Aer fallback
-    # --------------------------------------------------------
+    # ========================================================
+    # 8.13. Simulador SOLO si se solicita explícitamente
+    # ========================================================
 
-    if AerSimulator is not None:
+    logger.warning(
+        "IQM execution explicitly disabled. "
+        "Using local AerSimulator."
+    )
 
-        logger.info(
-            "IQM no disponible; usando AerSimulator local."
+    if AerSimulator is None:
+
+        raise RuntimeError(
+            "AerSimulator no está disponible."
         )
 
-        simulator = AerSimulator()
+    simulator = AerSimulator()
 
-        job = simulator.run(
-            circuit,
-            shots=shots,
-        )
+    transpiled_circuit = transpile(
+        circuit,
+        simulator
+    )
 
-        result = job.result()
+    job = simulator.run(
+        transpiled_circuit,
+        shots=shots
+    )
 
-        counts = result.get_counts()
+    result = job.result()
 
-        return (
-            counts,
-            "Qiskit AerSimulator",
-            None,
-        )
+    counts = result.get_counts()
 
-    raise RuntimeError(
-        "No quantum backend available. "
-        "Install qiskit-aer or configure IQM Resonance."
+    return (
+        counts,
+        "Qiskit AerSimulator",
+        None,
     )
 
 
 # ============================================================
-# OPERATIONAL METRICS
+# PASO 9. DECODIFICACIÓN DE BITSTRING
+# ============================================================
+
+def bitstring_to_selected_nodes(
+    bitstring: str,
+    nodes: List[str],
+) -> List[str]:
+    """
+    Convierte un bitstring QAOA en nodos seleccionados.
+
+    Qiskit devuelve los bits en orden little-endian respecto
+    al registro clásico. Por ello se invierte el string antes
+    de asociarlo a la lista de nodos.
+
+    Ejemplo:
+
+        nodes = [C01, C02, C03, C04, C05]
+
+        bitstring = 00101
+
+    Después de invertir:
+
+        10100
+
+    Seleccionaría:
+
+        C01, C03
+
+    """
+
+    clean = (
+        str(bitstring)
+        .replace(" ", "")
+    )
+
+    clean = clean[::-1]
+
+    selected = []
+
+    for index, node in enumerate(nodes):
+
+        if index >= len(clean):
+            break
+
+        if clean[index] == "1":
+            selected.append(node)
+
+    return selected
+
+
+# ============================================================
+# PASO 10. EVALUAR TODOS LOS BITSTRINGS
+# ============================================================
+
+def select_best_qaoa_bitstring(
+    counts: Dict[str, int],
+    graph: nx.Graph,
+    weights: Dict[str, float],
+    penalty: float,
+) -> Tuple[str, List[str], float]:
+    """
+    Selecciona el mejor bitstring observado.
+
+    IMPORTANTE
+    ----------
+
+    No se selecciona simplemente el bitstring más frecuente.
+
+    Para cada bitstring:
+
+        1. Se convierte a solución.
+        2. Se calcula la energía QUBO.
+        3. Se compara la energía.
+        4. En caso de empate se utilizan los shots.
+
+    El criterio correcto es:
+
+        menor energía QUBO = mejor solución
+    """
+
+    nodes = list(graph.nodes)
+
+    best_bitstring = None
+    best_nodes = []
+    best_energy = float("inf")
+    best_shots = -1
+
+    for bitstring, shots_observed in counts.items():
+
+        selected_nodes = bitstring_to_selected_nodes(
+            bitstring,
+            nodes
+        )
+
+        energy = qubo_energy(
+            graph,
+            weights,
+            selected_nodes,
+            penalty
+        )
+
+        if (
+            energy < best_energy
+            or (
+                math.isclose(
+                    energy,
+                    best_energy
+                )
+                and shots_observed > best_shots
+            )
+        ):
+
+            best_bitstring = bitstring
+            best_nodes = selected_nodes
+            best_energy = energy
+            best_shots = shots_observed
+
+    if best_bitstring is None:
+
+        raise RuntimeError(
+            "QAOA no devolvió ningún bitstring."
+        )
+
+    return (
+        best_bitstring,
+        best_nodes,
+        float(best_energy),
+    )
+
+
+# ============================================================
+# PASO 11. REPARACIÓN DE SOLUCIONES
+# ============================================================
+
+class MWISPruner:
+    """
+    Repara una solución que contenga conflictos.
+
+    Estrategia:
+
+        - Mientras exista un conflicto:
+        - identificar los nodos conflictivos
+        - eliminar el nodo con peor relación:
+
+              weight / degree
+
+    Es una heurística determinista.
+
+    No sustituye al optimizador.
+    Se utiliza como mecanismo de robustez para convertir
+    una solución QAOA potencialmente no factible en una
+    solución MWIS factible.
+    """
+
+    def __init__(
+        self,
+        graph: nx.Graph,
+        weights: Dict[str, float],
+    ):
+        self.graph = graph
+        self.weights = weights
+
+    def prune_solution(
+        self,
+        selected_nodes: List[str],
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Devuelve:
+
+            solución reparada
+            nodos eliminados
+        """
+
+        selected = set(selected_nodes)
+
+        pruned_nodes = []
+
+        while True:
+
+            conflicts = []
+
+            for u, v in self.graph.edges:
+
+                if (
+                    u in selected
+                    and v in selected
+                ):
+
+                    conflicts.append(
+                        (u, v)
+                    )
+
+            if not conflicts:
+                break
+
+            conflicting_nodes = set()
+
+            for u, v in conflicts:
+
+                conflicting_nodes.add(u)
+                conflicting_nodes.add(v)
+
+            # ------------------------------------------------
+            # Calcular score weight / degree
+            # ------------------------------------------------
+
+            candidate = None
+            candidate_score = float("inf")
+
+            for node in conflicting_nodes:
+
+                degree = max(
+                    1,
+                    self.graph.degree(node)
+                )
+
+                score = (
+                    self.weights[node]
+                    / degree
+                )
+
+                if score < candidate_score:
+
+                    candidate = node
+                    candidate_score = score
+
+            if candidate is None:
+                break
+
+            selected.remove(candidate)
+
+            pruned_nodes.append(candidate)
+
+        return (
+            list(selected),
+            pruned_nodes,
+        )
+
+
+# ============================================================
+# PASO 12. SOLUCIÓN EXACTA CLÁSICA
+# ============================================================
+
+def calculate_exact_ground_truth(
+    graph: nx.Graph,
+    weights: Dict[str, float],
+) -> Tuple[List[str], float]:
+    """
+    Calcula la solución MWIS exacta mediante:
+
+        MWIS(G) = Maximum Weight Clique(complement(G))
+
+    Se utiliza NetworkX.
+
+    NOTA
+    ----
+
+    Esta referencia exacta está pensada para instancias pequeñas
+    de validación y benchmarking.
+
+    No debe interpretarse como un método escalable a grandes
+    instancias ferroviarias.
+    """
+
+    if len(graph) == 0:
+
+        return [], 0.0
+
+    complement = nx.complement(graph)
+
+    # --------------------------------------------------------
+    # NetworkX max_weight_clique utiliza pesos enteros.
+    # --------------------------------------------------------
+
+    for node in complement.nodes:
+
+        complement.nodes[node]["weight"] = int(
+            round(
+                weights[node]
+            )
+        )
+
+    clique, clique_weight = nx.max_weight_clique(
+        complement,
+        weight="weight"
+    )
+
+    selected_nodes = list(clique)
+
+    # --------------------------------------------------------
+    # Recalcular utilizando los pesos float originales.
+    # --------------------------------------------------------
+
+    total_weight = sum(
+        weights[node]
+        for node in selected_nodes
+    )
+
+    return (
+        selected_nodes,
+        float(total_weight),
+    )
+
+
+# ============================================================
+# PASO 13. MÉTRICAS OPERACIONALES
 # ============================================================
 
 def calculate_operational_metrics(
-    selected_nodes,
-    node_data,
-):
-    total_passenger_km = 0.0
-    total_empty_km = 0.0
-    total_operating_cost = 0.0
+    graph: nx.Graph,
+    selected_nodes: List[str],
+) -> Dict[str, float]:
+    """
+    Calcula métricas operacionales de la solución seleccionada.
 
-    scheduled_trips = set()
+    Estas métricas NO modifican el objetivo MWIS cuando existe
+    un campo `weight` explícito.
+
+    Se utilizan para interpretar la solución desde el punto
+    de vista ferroviario.
+    """
+
+    selected = set(selected_nodes)
+
+    passenger_km = 0.0
+    empty_km = 0.0
+    operating_cost = 0.0
+
     covered_trips = set()
 
-    for node in node_data.values():
+    for node in selected:
 
-        for trip in node.get("trips", []):
-            scheduled_trips.add(trip)
+        data = graph.nodes[node]
 
-    for node_id in selected_nodes:
-
-        data = node_data[node_id]
-
-        total_passenger_km += float(
+        passenger_km += float(
             data.get(
                 "passenger_km",
-                0.0,
+                0.0
             )
         )
 
-        total_empty_km += float(
+        empty_km += float(
             data.get(
                 "empty_km",
-                0.0,
+                0.0
             )
         )
 
-        total_operating_cost += float(
+        operating_cost += float(
             data.get(
                 "operating_cost",
-                0.0,
+                0.0
             )
         )
 
-        for trip in data.get("trips", []):
-            covered_trips.add(trip)
+        for trip in data.get(
+            "trips",
+            []
+        ):
 
-    scheduled_count = len(scheduled_trips)
-    covered_count = len(
-        covered_trips.intersection(
-            scheduled_trips
-        )
-    )
-
-    if scheduled_count > 0:
-        coverage_percent = (
-            covered_count
-            / scheduled_count
-            * 100.0
-        )
-    else:
-        coverage_percent = 0.0
+            covered_trips.add(
+                str(trip)
+            )
 
     return {
         "total_passenger_km": float(
-            total_passenger_km
+            passenger_km
         ),
         "total_empty_km": float(
-            total_empty_km
+            empty_km
         ),
         "total_operating_cost": float(
-            total_operating_cost
+            operating_cost
         ),
-        "scheduled_trips": int(
-            scheduled_count
+        "covered_trips": len(
+            covered_trips
         ),
-        "covered_trips": int(
-            covered_count
-        ),
-        "coverage_percent": float(
-            coverage_percent
-        ),
+        "_covered_trip_ids": covered_trips,
     }
 
 
 # ============================================================
-# MAIN SOLVER
+# PASO 14. VISUALIZACIÓN
+# ============================================================
+
+class VisualizationAssetGenerator:
+    """
+    Genera un PNG del grafo de conflictos.
+
+    QCentroid recoge automáticamente los archivos generados
+    dentro de:
+
+        additional_output/
+
+    El archivo no tiene que incluirse dentro del JSON.
+    """
+
+    @staticmethod
+    def generate_conflict_graph(
+        graph: nx.Graph,
+        selected_nodes: List[str],
+    ) -> str:
+
+        # ----------------------------------------------------
+        # Directorio de assets de QCentroid
+        # ----------------------------------------------------
+
+        output_dir = (
+            "additional_output"
+        )
+
+        os.makedirs(
+            output_dir,
+            exist_ok=True
+        )
+
+        path = os.path.join(
+            output_dir,
+            "conflict_graph.png"
+        )
+
+        # ----------------------------------------------------
+        # Layout
+        # ----------------------------------------------------
+
+        plt.figure(
+            figsize=(9, 7),
+            dpi=150
+        )
+
+        pos = nx.spring_layout(
+            graph,
+            seed=42
+        )
+
+        # ----------------------------------------------------
+        # Colores
+        # ----------------------------------------------------
+        # Se utiliza la API estándar de NetworkX.
+        # Los nodos seleccionados se diferencian visualmente.
+        # ----------------------------------------------------
+
+        node_colors = []
+
+        selected = set(
+            selected_nodes
+        )
+
+        for node in graph.nodes:
+
+            if node in selected:
+                node_colors.append(
+                    "green"
+                )
+            else:
+                node_colors.append(
+                    "lightgray"
+                )
+
+        nx.draw_networkx_edges(
+            graph,
+            pos,
+            alpha=0.6
+        )
+
+        nx.draw_networkx_nodes(
+            graph,
+            pos,
+            node_color=node_colors,
+            node_size=900
+        )
+
+        nx.draw_networkx_labels(
+            graph,
+            pos,
+            font_weight="bold"
+        )
+
+        plt.title(
+            "Railway Rolling Stock Conflict Graph"
+        )
+
+        plt.axis("off")
+
+        plt.savefig(
+            path,
+            bbox_inches="tight"
+        )
+
+        plt.close()
+
+        logger.info(
+            "Conflict graph visualization saved to %s",
+            path
+        )
+
+        return path
+
+
+# ============================================================
+# PASO 15. VALIDACIÓN DE INPUT
+# ============================================================
+
+def validate_input_data(
+    input_data: Dict[str, Any],
+) -> None:
+    """
+    Comprueba que el dataset contiene la estructura mínima
+    necesaria para ejecutar el solver.
+    """
+
+    if not isinstance(
+        input_data,
+        dict
+    ):
+
+        raise ValueError(
+            "Input data debe ser un objeto JSON."
+        )
+
+    if "nodes" not in input_data:
+
+        raise ValueError(
+            "Input data debe contener 'nodes'."
+        )
+
+    if "edges" not in input_data:
+
+        raise ValueError(
+            "Input data debe contener 'edges'."
+        )
+
+    if not isinstance(
+        input_data["nodes"],
+        list
+    ):
+
+        raise ValueError(
+            "'nodes' debe ser una lista."
+        )
+
+    if not isinstance(
+        input_data["edges"],
+        list
+    ):
+
+        raise ValueError(
+            "'edges' debe ser una lista."
+        )
+
+
+# ============================================================
+# PASO 16. FUNCIÓN PRINCIPAL QCentroid
 # ============================================================
 
 def run(
-    input_data,
-    solver_params=None,
-    extra_arguments=None,
-):
+    input_data: Dict[str, Any],
+    solver_params: Dict[str, Any],
+    extra_arguments: Dict[str, Any],
+) -> Dict[str, Any]:
     """
-    QCentroid solver entry point.
+    Punto de entrada principal del solver para QCentroid.
+
+    QCentroid llama a:
+
+        run(
+            input_data,
+            solver_params,
+            extra_arguments
+        )
+
+    La función devuelve un diccionario JSON-compatible.
     """
 
-    start_time = time.perf_counter()
+    # ========================================================
+    # 16.1. Inicio del cronómetro
+    # ========================================================
 
-    solver_params = solver_params or {}
-    extra_arguments = extra_arguments or {}
-
-    # --------------------------------------------------------
-    # Input
-    # --------------------------------------------------------
-
-    nodes = input_data.get(
-        "nodes",
-        [],
-    )
-
-    edges = input_data.get(
-        "edges",
-        [],
-    )
-
-    if not nodes:
-        raise ValueError(
-            "Input data contains no nodes."
-        )
+    execution_start = time.perf_counter()
 
     logger.info(
-        "Construyendo grafo de conflictos: "
-        "%d nodos, %d conflictos.",
-        len(nodes),
-        len(edges),
-    )
-
-    objective = MWISObjective(
-        nodes,
-        edges,
+        "==================================================="
     )
 
     logger.info(
-        "Objetivo: maximizar suma(weight_i * x_i)."
-    )
-
-    # --------------------------------------------------------
-    # QUBO penalty
-    # --------------------------------------------------------
-
-    max_weight = max(
-        objective.weights.values()
-    )
-
-    penalty = float(
-        solver_params.get(
-            "penalty",
-            4.0 * max_weight,
-        )
+        "Railway MWIS + QAOA solver started."
     )
 
     logger.info(
-        "Penalty QUBO: %.4f",
-        penalty,
+        "==================================================="
     )
 
-    # --------------------------------------------------------
-    # QAOA parameters
-    # --------------------------------------------------------
+    # ========================================================
+    # 16.2. Validación del input
+    # ========================================================
 
-    qaoa_depth = int(
-        solver_params.get(
-            "qaoa_depth",
-            2,
-        )
+    validate_input_data(
+        input_data
     )
+
+    # ========================================================
+    # 16.3. Leer parámetros QCentroid
+    # ========================================================
+
+    #
+    # QCentroid pasa:
+    #
+    #   iqm_token
+    #   quantum_computer
+    #   shots
+    #   qaoa_depth
+    #
 
     shots = int(
-        solver_params.get(
+        extra_arguments.get(
             "shots",
-            2048,
+            2048
         )
     )
 
-    gamma = float(
-        solver_params.get(
-            "gamma",
-            0.2,
+    qaoa_depth = int(
+        extra_arguments.get(
+            "qaoa_depth",
+            2
         )
     )
 
-    beta = float(
-        solver_params.get(
-            "beta",
-            0.5,
+    quantum_computer = str(
+        extra_arguments.get(
+            "quantum_computer",
+            "emerald"
         )
     )
 
     logger.info(
-        "QAOA: depth=%d, shots=%d, gamma=%.4f, beta=%.4f",
-        qaoa_depth,
-        shots,
-        gamma,
-        beta,
+        "QCentroid parameters received:"
+    )
+
+    logger.info(
+        "  quantum_computer = %s",
+        quantum_computer
+    )
+
+    logger.info(
+        "  shots = %d",
+        shots
+    )
+
+    logger.info(
+        "  qaoa_depth = %d",
+        qaoa_depth
     )
 
     # --------------------------------------------------------
-    # Build QAOA circuit
+    # No mostramos nunca el token.
     # --------------------------------------------------------
+
+    logger.info(
+        "  iqm_token = [PROVIDED]"
+        if extra_arguments.get("iqm_token")
+        else
+        "  iqm_token = [NOT PROVIDED]"
+    )
+
+    # ========================================================
+    # 16.4. Construir grafo
+    # ========================================================
+
+    graph = build_conflict_graph(
+        input_data
+    )
+
+    logger.info(
+        "Conflict graph created:"
+    )
+
+    logger.info(
+        "  nodes = %d",
+        graph.number_of_nodes()
+    )
+
+    logger.info(
+        "  conflicts = %d",
+        graph.number_of_edges()
+    )
+
+    # ========================================================
+    # 16.5. Crear objetivo MWIS
+    # ========================================================
+
+    objective = MWISObjective(
+        graph
+    )
+
+    weights = objective.weights
+
+    logger.info(
+        "Optimization objective: "
+        "maximize sum(weight_i * x_i)"
+    )
+
+    # ========================================================
+    # 16.6. Calcular penalización QUBO
+    # ========================================================
+
+    penalty = calculate_penalty(
+        weights
+    )
+
+    logger.info(
+        "QUBO penalty lambda = %.6f",
+        penalty
+    )
+
+    # ========================================================
+    # 16.7. Calcular ground truth exacto
+    # ========================================================
+
+    logger.info(
+        "Calculating exact classical ground truth..."
+    )
+
+    exact_nodes, exact_weight = (
+        calculate_exact_ground_truth(
+            graph,
+            weights
+        )
+    )
+
+    logger.info(
+        "Exact solution = %s",
+        exact_nodes
+    )
+
+    logger.info(
+        "Exact total weight = %.6f",
+        exact_weight
+    )
+
+    # ========================================================
+    # 16.8. Construir circuito QAOA
+    # ========================================================
+
+    logger.info(
+        "Building QAOA circuit..."
+    )
 
     circuit = build_qaoa_circuit(
-        objective=objective,
-        penalty=penalty,
-        qaoa_depth=qaoa_depth,
-        gamma=gamma,
-        beta=beta,
-    )
-
-    # --------------------------------------------------------
-    # Execute QAOA
-    # --------------------------------------------------------
-
-    counts, backend_used, job_id = execute_qaoa(
-        circuit=circuit,
-        shots=shots,
-        extra_arguments=extra_arguments,
+        graph,
+        weights,
+        penalty,
+        qaoa_depth
     )
 
     logger.info(
-        "Backend utilizado: %s",
-        backend_used,
+        "QAOA circuit created:"
     )
 
     logger.info(
-        "Measurement counts: %s",
+        "  qubits = %d",
+        circuit.num_qubits
+    )
+
+    logger.info(
+        "  depth = %s",
+        circuit.depth()
+    )
+
+    # ========================================================
+    # 16.9. Ejecutar QAOA
+    # ========================================================
+
+    logger.info(
+        "Executing QAOA..."
+    )
+
+    counts, backend_used, job_id = (
+        execute_qaoa(
+            circuit,
+            extra_arguments
+        )
+    )
+
+    logger.info(
+        "QAOA backend used: %s",
+        backend_used
+    )
+
+    logger.info(
+        "QAOA job ID: %s",
+        job_id
+    )
+
+    logger.info(
+        "Number of measured bitstrings: %d",
+        len(counts)
+    )
+
+    # ========================================================
+    # 16.10. Seleccionar mejor bitstring
+    # ========================================================
+
+    (
+        best_bitstring,
+        initial_solution,
+        initial_energy,
+    ) = select_best_qaoa_bitstring(
         counts,
-    )
-
-    # --------------------------------------------------------
-    # Evaluate all observed bitstrings
-    # --------------------------------------------------------
-
-    best_qaoa = select_best_qaoa_bitstring(
-        counts=counts,
-        objective=objective,
-        penalty=penalty,
-    )
-
-    initial_bitstring = best_qaoa[
-        "bitstring"
-    ]
-
-    initial_selected_nodes = best_qaoa[
-        "selected_nodes"
-    ]
-
-    initial_qubo_energy = best_qaoa[
-        "qubo_energy"
-    ]
-
-    initial_solution_size = len(
-        initial_selected_nodes
+        graph,
+        weights,
+        penalty
     )
 
     logger.info(
-        "Mejor bitstring QAOA por energía QUBO: %s",
-        initial_bitstring,
+        "Best observed bitstring: %s",
+        best_bitstring
     )
 
     logger.info(
-        "Energía QUBO: %.4f",
-        initial_qubo_energy,
+        "Initial QUBO energy: %.6f",
+        initial_energy
     )
 
-    # --------------------------------------------------------
-    # Feasibility repair
-    # --------------------------------------------------------
+    logger.info(
+        "Initial selected cycles: %s",
+        initial_solution
+    )
+
+    # ========================================================
+    # 16.11. Reparar solución si presenta conflictos
+    # ========================================================
 
     pruner = MWISPruner(
-        objective.graph,
-        objective.weights,
+        graph,
+        weights
     )
 
-    selected_nodes, pruned_nodes = (
-        pruner.prune_solution(
-            initial_selected_nodes
-        )
-    )
-
-    nodes_pruned = len(
-        pruned_nodes
-    )
-
-    if nodes_pruned > 0:
-        logger.info(
-            "Se eliminaron %d nodos para reparar conflictos.",
-            nodes_pruned,
-        )
-
-    # --------------------------------------------------------
-    # Final objective
-    # --------------------------------------------------------
-
-    total_weight = objective.objective_value(
-        selected_nodes
-    )
-
-    final_qubo_energy = objective.qubo_energy(
+    (
         selected_nodes,
-        penalty,
+        pruned_nodes,
+    ) = pruner.prune_solution(
+        initial_solution
     )
 
-    # --------------------------------------------------------
-    # Feasibility
-    # --------------------------------------------------------
+    if pruned_nodes:
 
-    is_feasible = True
+        logger.info(
+            "Pruning removed conflicting nodes: %s",
+            pruned_nodes
+        )
 
-    selected_set = set(
+    else:
+
+        logger.info(
+            "No pruning required."
+        )
+
+    # ========================================================
+    # 16.12. Comprobar factibilidad
+    # ========================================================
+
+    is_feasible = nx.is_independent_set(
+        graph,
         selected_nodes
     )
 
-    for u, v in objective.graph.edges():
+    if not is_feasible:
 
-        if (
-            u in selected_set
-            and v in selected_set
-        ):
-            is_feasible = False
-            break
-
-    # --------------------------------------------------------
-    # Exact classical ground truth
-    # --------------------------------------------------------
-
-    ground_truth_exact = None
-    optimality_gap_percent = None
-
-    try:
-
-        exact_selected_nodes, exact_total_weight = (
-            objective.exact_solution()
+        raise RuntimeError(
+            "La solución final no es un independent set válido."
         )
 
-        ground_truth_exact = {
-            "selected_cycles": exact_selected_nodes,
-            "total_weight": float(
-                exact_total_weight
-            ),
-        }
+    # ========================================================
+    # 16.13. Peso final
+    # ========================================================
 
-        # ----------------------------------------------------
-        # IMPORTANT BENCHMARK CALCULATION
-        #
-        # gap (%) =
-        #
-        #     (OPT - SOL) / OPT * 100
-        #
-        # Therefore:
-        #
-        #     SOL == OPT  -> 0.0 %
-        # ----------------------------------------------------
-
-        if (
-            exact_total_weight is not None
-            and float(exact_total_weight) > 0.0
-        ):
-
-            optimality_gap_percent = (
-                (
-                    float(exact_total_weight)
-                    - float(total_weight)
-                )
-                / float(exact_total_weight)
-            ) * 100.0
-
-            # Remove floating point noise.
-            if abs(
-                optimality_gap_percent
-            ) < 1e-10:
-
-                optimality_gap_percent = 0.0
-
-            # A solution cannot have a negative
-            # optimality gap relative to the exact optimum.
-            optimality_gap_percent = max(
-                0.0,
-                float(
-                    optimality_gap_percent
-                ),
-            )
-
-            optimality_gap_percent = float(
-                optimality_gap_percent
-            )
-
-        else:
-            optimality_gap_percent = None
-
-        ground_truth_exact[
-            "optimality_gap_percent"
-        ] = (
-            float(optimality_gap_percent)
-            if optimality_gap_percent is not None
-            else None
-        )
-
-        logger.info(
-            "Ground truth exacto: %s | weight=%.4f",
-            exact_selected_nodes,
-            exact_total_weight,
-        )
-
-        logger.info(
-            "Optimality gap: %s%%",
-            optimality_gap_percent,
-        )
-
-    except Exception as exc:
-
-        logger.warning(
-            "No se pudo calcular el ground truth exacto: %s",
-            exc,
-        )
-
-        ground_truth_exact = {
-            "selected_cycles": [],
-            "total_weight": None,
-            "optimality_gap_percent": None,
-        }
-
-    # --------------------------------------------------------
-    # Operational metrics
-    # --------------------------------------------------------
-
-    operational = calculate_operational_metrics(
-        selected_nodes=selected_nodes,
-        node_data=objective.node_data,
+    total_weight = objective.total_weight(
+        selected_nodes
     )
 
-    # --------------------------------------------------------
-    # Visualization
-    # --------------------------------------------------------
+    # ========================================================
+    # 16.14. Métricas operacionales
+    # ========================================================
 
-    assets = {}
+    operational = (
+        calculate_operational_metrics(
+            graph,
+            selected_nodes
+        )
+    )
 
-    try:
+    # ========================================================
+    # 16.15. Cobertura de viajes
+    # ========================================================
 
-        assets = (
-            VisualizationAssetGenerator.generate(
-                graph=objective.graph,
-                weights=objective.weights,
-                selected_nodes=selected_nodes,
+    all_trips = set()
+
+    for node in graph.nodes:
+
+        for trip in graph.nodes[node].get(
+            "trips",
+            []
+        ):
+
+            all_trips.add(
+                str(trip)
             )
+
+    scheduled_trips = len(
+        all_trips
+    )
+
+    covered_trips = operational[
+        "covered_trips"
+    ]
+
+    if scheduled_trips > 0:
+
+        coverage_rate = (
+            covered_trips
+            / scheduled_trips
         )
 
-    except Exception as exc:
+    else:
 
-        logger.warning(
-            "No se pudo generar la visualización: %s",
-            exc,
+        coverage_rate = 0.0
+
+    coverage_percent = (
+        100.0
+        * coverage_rate
+    )
+
+    # ========================================================
+    # 16.16. Gap de optimalidad
+    # ========================================================
+
+    if exact_weight != 0:
+
+        optimality_gap_percent = (
+            100.0
+            * (
+                exact_weight
+                - total_weight
+            )
+            / abs(exact_weight)
         )
 
-    # --------------------------------------------------------
-    # Execution time
-    # --------------------------------------------------------
+    else:
+
+        optimality_gap_percent = 0.0
+
+    # Evitamos pequeños errores numéricos negativos.
+
+    if abs(
+        optimality_gap_percent
+    ) < 1e-12:
+
+        optimality_gap_percent = 0.0
+
+    # ========================================================
+    # 16.17. Generar asset gráfico
+    # ========================================================
+
+    conflict_graph_path = (
+        VisualizationAssetGenerator
+        .generate_conflict_graph(
+            graph,
+            selected_nodes
+        )
+    )
+
+    # ========================================================
+    # 16.18. Tiempo de ejecución
+    # ========================================================
 
     execution_time_seconds = (
         time.perf_counter()
-        - start_time
-    )
-
-    # --------------------------------------------------------
-    # Benchmark logging
-    # --------------------------------------------------------
-
-    logger.info(
-        "BENCHMARK METRICS | "
-        "total_weight=%.4f | "
-        "optimality_gap_percent=%s | "
-        "coverage_percent=%.4f | "
-        "execution_time_seconds=%.6f | "
-        "total_operating_cost=%.4f",
-        float(total_weight),
-        (
-            f"{optimality_gap_percent:.4f}"
-            if optimality_gap_percent is not None
-            else "None"
-        ),
-        float(
-            operational[
-                "coverage_percent"
-            ]
-        ),
-        float(
-            execution_time_seconds
-        ),
-        float(
-            operational[
-                "total_operating_cost"
-            ]
-        ),
+        - execution_start
     )
 
     # ========================================================
-    # FINAL RESULT
-    #
-    # IMPORTANT:
-    #
-    # These five fields MUST be at top level because they are
-    # the QCentroid output benchmark parameters.
+    # 16.19. Estadísticas de pruning
     # ========================================================
+
+    pruning_stats = {
+        "nodes_pruned_count": len(
+            pruned_nodes
+        ),
+        "pruned_nodes_list": list(
+            pruned_nodes
+        ),
+    }
+
+    # ========================================================
+    # 16.20. Resultado final
+    # ========================================================
+
+    #
+    # IMPORTANTE PARA QCentroid
+    #
+    # Las cinco métricas de benchmark están en el nivel raíz:
+    #
+    #   total_weight
+    #   optimality_gap_percent
+    #   coverage_percent
+    #   execution_time_seconds
+    #   total_operating_cost
+    #
+    # Esto permite que QCentroid las utilice directamente
+    # como Output Benchmark Metrics.
+    #
 
     result = {
 
         # ----------------------------------------------------
-        # QCentroid benchmark metrics
+        # BENCHMARK METRICS
         # ----------------------------------------------------
 
         "total_weight": float(
             total_weight
         ),
 
-        "optimality_gap_percent": (
-            float(
-                optimality_gap_percent
-            )
-            if optimality_gap_percent is not None
-            else None
+        "optimality_gap_percent": float(
+            optimality_gap_percent
         ),
 
         "coverage_percent": float(
-            operational[
-                "coverage_percent"
-            ]
+            coverage_percent
         ),
 
         "execution_time_seconds": float(
@@ -1254,41 +2020,35 @@ def run(
         ),
 
         # ----------------------------------------------------
-        # Solution
+        # SOLUCIÓN
         # ----------------------------------------------------
 
         "selected_cycles": list(
             selected_nodes
         ),
 
-        "scheduled_trips": int(
-            operational[
-                "scheduled_trips"
-            ]
-        ),
-
-        "covered_trips": int(
-            operational[
-                "covered_trips"
-            ]
-        ),
-
         "is_feasible": bool(
             is_feasible
         ),
 
-        "backend_used": backend_used,
-
         # ----------------------------------------------------
-        # Exact classical reference
+        # COBERTURA
         # ----------------------------------------------------
 
-        "ground_truth_exact": (
-            ground_truth_exact
+        "scheduled_trips": int(
+            scheduled_trips
+        ),
+
+        "covered_trips": int(
+            covered_trips
+        ),
+
+        "coverage_rate": float(
+            coverage_rate
         ),
 
         # ----------------------------------------------------
-        # Operational metrics
+        # MÉTRICAS OPERACIONALES
         # ----------------------------------------------------
 
         "total_passenger_km": float(
@@ -1304,7 +2064,90 @@ def run(
         ),
 
         # ----------------------------------------------------
-        # Execution metrics
+        # BACKEND
+        # ----------------------------------------------------
+
+        "backend_used": str(
+            backend_used
+        ),
+
+        "job_id": job_id,
+
+        # ----------------------------------------------------
+        # QAOA
+        # ----------------------------------------------------
+
+        "initial_bitstring_min_qubo": str(
+            best_bitstring
+        ),
+
+        "initial_qubo_energy": float(
+            initial_energy
+        ),
+
+        "initial_solution_size": int(
+            len(initial_solution)
+        ),
+
+        "final_solution_size": int(
+            len(selected_nodes)
+        ),
+
+        "shots": int(
+            shots
+        ),
+
+        "qaoa_depth": int(
+            qaoa_depth
+        ),
+
+        "penalty": float(
+            penalty
+        ),
+
+        # ----------------------------------------------------
+        # GROUND TRUTH
+        # ----------------------------------------------------
+
+        "ground_truth_exact": {
+
+            "selected_cycles": list(
+                exact_nodes
+            ),
+
+            "total_weight": float(
+                exact_weight
+            ),
+
+            "optimality_gap_percent": float(
+                optimality_gap_percent
+            ),
+        },
+
+        # ----------------------------------------------------
+        # PRUNING
+        # ----------------------------------------------------
+
+        "nodes_pruned": int(
+            len(pruned_nodes)
+        ),
+
+        "pruning_stats": pruning_stats,
+
+        # ----------------------------------------------------
+        # ASSETS
+        # ----------------------------------------------------
+
+        "assets": {
+
+            "conflict_graph_png": (
+                conflict_graph_path
+            )
+
+        },
+
+        # ----------------------------------------------------
+        # DETALLE DE EJECUCIÓN
         # ----------------------------------------------------
 
         "execution_metrics": {
@@ -1317,21 +2160,19 @@ def run(
                 len(selected_nodes)
             ),
 
-            "initial_bitstring_min_qubo": (
-                initial_bitstring
+            "initial_bitstring_min_qubo": str(
+                best_bitstring
             ),
 
             "initial_qubo_energy": float(
-                initial_qubo_energy
-            ),
-
-            "final_qubo_energy": float(
-                final_qubo_energy
+                initial_energy
             ),
 
             "initial_solution_size": int(
-                initial_solution_size
+                len(initial_solution)
             ),
+
+            "job_id": job_id,
 
             "penalty": float(
                 penalty
@@ -1344,53 +2185,69 @@ def run(
             "shots": int(
                 shots
             ),
-
-            "job_id": job_id,
         },
-
-        # ----------------------------------------------------
-        # Pruning
-        # ----------------------------------------------------
-
-        "nodes_pruned": int(
-            nodes_pruned
-        ),
-
-        "pruning_stats": {
-            "nodes_pruned_count": int(
-                nodes_pruned
-            ),
-            "pruned_nodes_list": list(
-                pruned_nodes
-            ),
-        },
-
-        # ----------------------------------------------------
-        # Assets
-        # ----------------------------------------------------
-
-        "assets": assets,
     }
 
-    # --------------------------------------------------------
-    # Final diagnostic
-    # --------------------------------------------------------
+    # ========================================================
+    # 16.21. Logging final
+    # ========================================================
 
     logger.info(
-        "Resultado final: selected_cycles=%s | "
-        "total_weight=%.4f | "
-        "optimality_gap_percent=%s | "
-        "coverage_percent=%.2f | "
-        "feasible=%s",
-        selected_nodes,
-        total_weight,
-        optimality_gap_percent,
-        operational[
-            "coverage_percent"
-        ],
-        is_feasible,
+        "==================================================="
     )
 
-    return result
+    logger.info(
+        "FINAL SOLUTION"
+    )
 
- 
+    logger.info(
+        "Selected cycles: %s",
+        selected_nodes
+    )
+
+    logger.info(
+        "Total weight: %.6f",
+        total_weight
+    )
+
+    logger.info(
+        "Coverage: %.2f%%",
+        coverage_percent
+    )
+
+    logger.info(
+        "Operating cost: %.2f",
+        operational[
+            "total_operating_cost"
+        ]
+    )
+
+    logger.info(
+        "Optimality gap: %.6f%%",
+        optimality_gap_percent
+    )
+
+    logger.info(
+        "Backend: %s",
+        backend_used
+    )
+
+    logger.info(
+        "Job ID: %s",
+        job_id
+    )
+
+    logger.info(
+        "Execution time: %.6f seconds",
+        execution_time_seconds
+    )
+
+    logger.info(
+        "==================================================="
+    )
+
+    # ========================================================
+    # 16.22. Devolver resultado a QCentroid
+    # ========================================================
+
+    return result
