@@ -1,8 +1,8 @@
-"""Solver IQM QAOA autónomo para Q-Centroid: un único fichero GitHub.
+"""Datos, generación y verificación independiente del caso ferroviario simulado.
 
-Recibe el JSON completo en run(input_data, solver_params, extra_arguments).
-IQM es el backend por defecto; Aer solo si se solicita use_iqm=False.
-La validación y el postprocesado están incluidos aquí, sin railway_core.py.
+Horas como enteros desde 00:00 del día 1; día 2 empieza en t=24.
+La distancia `passenger_km` significa km recorridos con viajeros por el tren,
+no pasajeros multiplicados por km.
 """
 from __future__ import annotations
 
@@ -189,142 +189,57 @@ def assess(data, selected_ids):
             "number_of_trains": len(selected)}
 
 
-
-import time
-
-
-def _prune(raw_ids, weights, adjacency):
-    selected = set(raw_ids)
-    while True:
-        degrees = {i: len(adjacency[i] & selected) for i in selected}
-        bad = [i for i in selected if degrees[i]]
-        if not bad:
-            return sorted(selected)
-        # Se conserva preferentemente peso/grado alto. Empate por ID.
-        remove = min(bad, key=lambda i: (weights[i] / (degrees[i] + 1), i))
-        selected.remove(remove)
-
-
-def _energy(ids, weights, edges, penalty):
-    chosen = set(ids)
-    return -sum(weights[i] for i in chosen) + penalty * sum(a in chosen and b in chosen for a, b in edges)
-
-
-def _decode(bitstring, ids):
-    bits = bitstring.replace(" ", "")[::-1]
-    if len(bits) != len(ids) or set(bits) - {"0", "1"}:
-        raise ValueError("Bitstring incompatible con la lista ordenada de ciclos")
-    return [ids[i] for i, bit in enumerate(bits) if bit == "1"]
-
-
-def _circuit(ids, weights, edges, penalty, depth, gamma, beta):
-    from qiskit import QuantumCircuit
-
-    n = len(ids)
-    position = {id_: i for i, id_ in enumerate(ids)}
-    degree = Counter(a for a, _ in edges) + Counter(b for _, b in edges)
-    scale = penalty  # Multiplicamos H por 1/scale para ángulos manejables.
-    circuit = QuantumCircuit(n, n)
-    for i in range(n):
-        circuit.h(i)
-    for _ in range(depth):
-        for id_ in ids:
-            a = (weights[id_] / 2 - penalty * degree[id_] / 4) / scale
-            circuit.rz(2 * gamma * a, position[id_])
-        for u, v in edges:
-            circuit.rzz(gamma * penalty / (2 * scale), position[u], position[v])
-        for i in range(n):
-            circuit.rx(2 * beta, i)
-    circuit.measure(range(n), range(n))
-    return circuit
-
-
-def _backend(extra):
-    if not extra.get("use_iqm", True):
-        from qiskit_aer import AerSimulator
-        return AerSimulator(), "AerSimulator"
-    token = extra.get("iqm_token")
-    if not token:
-        raise ValueError("Falta iqm_token. Para simulación explícita use_iqm=false.")
-    from iqm.qiskit_iqm import IQMProvider
-    from urllib.parse import urlsplit
-    import os
-    url = str(os.getenv("IQM_SERVER_URL", "https://resonance.iqm.tech/")).strip()
-    if urlsplit(url).hostname in {"cocos.resonance.meetiqm.com", "resonance.meetiqm.com"}:
-        url = "https://resonance.iqm.tech/"
-    if urlsplit(url).scheme != "https":
-        raise ValueError("IQM_SERVER_URL debe usar https")
-    provider = IQMProvider(url.rstrip("/") + "/",
-                           quantum_computer=str(extra.get("quantum_computer", "emerald")),
-                           token=token)
-    return provider.get_backend(), "IQM Resonance"
-
-
-def evaluate_counts(data, counts):
-    """Evaluación pura, utilizable para verificar el decodificador sin QPU."""
+def exact_cpu(data):
+    """DP exacta sobre máscaras de servicios, maximiza MWIS y deshace empates
+    por menos trenes. El tiempo indicado excluye generación y validación.
+    """
+    from time import perf_counter
+    overall_start = perf_counter()
     validate_dataset(data)
-    ids = [n["id"] for n in data["nodes"]]
-    weights = {n["id"]: n["weight"] for n in data["nodes"]}
-    edges = [tuple(e) for e in data["edges"]]
-    adjacency = {id_: set() for id_ in ids}
-    for a, b in edges:
-        adjacency[a].add(b)
-        adjacency[b].add(a)
-    penalty = 4 * max(abs(w) for w in weights.values())
-    candidates = []
-    for bitstring, shots in counts.items():
-        raw = _decode(bitstring, ids)
-        repaired = _prune(raw, weights, adjacency)
-        report = assess(data, repaired)
-        candidates.append((report, bitstring, int(shots), _energy(raw, weights, edges, penalty), raw))
-    if not candidates:
-        raise ValueError("No hay muestras QAOA")
-    best = max(candidates, key=lambda row: (
-        row[0]["full_coverage"], row[0]["total_weight"],
-        -row[0]["number_of_trains"], row[2]))
-    raw_lowest = min(candidates, key=lambda row: (row[3], -row[2]))
-    report, bits, frequency, energy, raw = best
-    return {**report, "bitstring_selected": bits, "selected_bitstring_shots": frequency,
-            "raw_selected_cycles": raw, "raw_qubo_energy": energy,
-            "lowest_raw_energy_bitstring": raw_lowest[1],
-            "unique_bitstrings": len(counts), "penalty": penalty,
-            "sample_selection_rule": "full coverage first, then MWIS weight after conflict pruning"}
+    t0 = perf_counter()
+    ids = [t["id"] for t in data["services"]]
+    bits = {t: 1 << i for i, t in enumerate(ids)}
+    states = {0: (0, ())}
+    for c in data["nodes"]:
+        cmask = sum(bits[t] for t in c["trips"])
+        for mask, (weight, chosen) in list(states.items()):
+            if mask & cmask:
+                continue
+            nxt = mask | cmask
+            alternative = (weight + c["weight"], chosen + (c["id"],))
+            previous = states.get(nxt)
+            if previous is None or (alternative[0], -len(alternative[1])) > (previous[0], -len(previous[1])):
+                states[nxt] = alternative
+    best_mask, best = max(states.items(), key=lambda item: (item[1][0], -len(item[1][1])))
+    full_mask = (1 << len(ids)) - 1
+    full = states.get(full_mask)
+    result = {"backend_used": "CPU exact DP", "objective": "MWIS: 2*passenger_km-empty_km",
+              "case_id": data["case_id"], "dataset_sha256": dataset_fingerprint(data),
+              "solver_time_seconds": perf_counter() - t0,
+              "explored_trip_masks": len(states), **assess(data, list(best[1]))}
+    if full:
+        full_result = assess(data, list(full[1]))
+        result["best_full_coverage"] = {
+            "selected_cycles": full_result["selected_cycles"],
+            "total_empty_km": full_result["total_empty_km"],
+            "number_of_trains": full_result["number_of_trains"],
+            "total_weight": full_result["total_weight"]}
+    else:
+        result["best_full_coverage"] = None
+    result["execution_time_seconds"] = perf_counter() - overall_start
+    return result
 
 
 def run(input_data, solver_params=None, extra_arguments=None):
-    """Punto de entrada QCentroid; solver_params queda reservado para la plataforma."""
-    del solver_params
-    extra = extra_arguments or {}
-    validate_dataset(input_data)
-    from qiskit import transpile
+    """Punto de entrada de Q-Centroid. Todo el solver CPU está en este fichero."""
+    del solver_params, extra_arguments
+    return exact_cpu(input_data)
 
-    t0 = time.perf_counter()
-    depth = int(extra.get("qaoa_depth", 1))
-    shots = int(extra.get("shots", 4096))
-    gamma, beta = float(extra.get("gamma", 0.8)), float(extra.get("beta", 0.35))
-    if depth < 1 or shots < 1:
-        raise ValueError("qaoa_depth y shots deben ser positivos")
-    ids = [n["id"] for n in input_data["nodes"]]
-    weights = {n["id"]: n["weight"] for n in input_data["nodes"]}
-    penalty = 4 * max(abs(w) for w in weights.values())
-    circuit = _circuit(ids, weights, [tuple(e) for e in input_data["edges"]],
-                       penalty, depth, gamma, beta)
-    backend, backend_used = _backend(extra)
-    t_compile = time.perf_counter()
-    circuit = transpile(circuit, backend=backend, optimization_level=2)
-    compile_seconds = time.perf_counter() - t_compile
-    t_job = time.perf_counter()
-    job = backend.run(circuit, shots=shots)
-    counts = job.result().get_counts()
-    job_seconds = time.perf_counter() - t_job
-    t_decode = time.perf_counter()
-    report = evaluate_counts(input_data, counts)
-    decode_seconds = time.perf_counter() - t_decode
-    return {**report, "backend_used": backend_used, "objective": "MWIS: 2*passenger_km-empty_km",
-            "case_id": input_data["case_id"], "dataset_sha256": dataset_fingerprint(input_data),
-            "qaoa_depth": depth, "shots": shots, "gamma_normalized": gamma, "beta": beta,
-            "transpile_seconds": compile_seconds, "backend_job_wall_seconds": job_seconds,
-            "postprocessing_seconds": decode_seconds,
-            "end_to_end_seconds": time.perf_counter() - t0,
-            "execution_time_seconds": time.perf_counter() - t0,
-            "job_id": job.job_id() if hasattr(job, "job_id") else None}
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+    if len(sys.argv) != 2:
+        raise SystemExit("Uso local: python qcentroid.py dataset_20_ciclos.json")
+    dataset = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    print(json.dumps(run(dataset), ensure_ascii=False, indent=2))
