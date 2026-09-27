@@ -1,0 +1,6 @@
+# Entorno Q-Centroid: Python 3.11 o posterior.
+# El extra qiskit instala Qiskit y el adaptador oficial de IQM.
+iqm-client[qiskit]==35.0.3
+
+# Simulador local opcional, usado solo con extra_arguments.use_iqm=false.
+qiskit-aer==0.17.2
