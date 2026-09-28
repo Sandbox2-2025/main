@@ -10,7 +10,7 @@ sirve como demostrador, no como planificación operativa de Deutsche Bahn.
 
 | Archivo | Función |
 | --- | --- |
-| `qcentroid.py` | Punto de entrada obligatorio; dirige la ejecución según `solver_params.algorithm`. |
+| `qcentroid.py` | Punto de entrada obligatorio; dirige la ejecución según `algorithm` o, para IQM, la presencia del token. |
 | `solver_cpu.py` | Valida el dataset y resuelve exactamente mediante programación dinámica sobre conjuntos de servicios. |
 | `solver_iqm.py` | Valida el dataset, prepara el circuito QAOA, lo ejecuta en IQM y evalúa las muestras. |
 | `requirements.txt` | Instala el adaptador Qiskit de IQM y Aer para simulación opcional. |
@@ -22,9 +22,11 @@ es necesario guardarlo en el repositorio.
 
 ## Configuración de los jobs
 
-El parámetro `algorithm` es **obligatorio**; no se elige el algoritmo en función
-de la presencia de un token. Ejecute CPU e IQM como dos jobs sobre el mismo
-dataset y conserve la revisión del código utilizada en cada ejecución.
+`algorithm` puede estar en `solver_params` o `extra_arguments`. Para la ruta
+IQM se acepta además el formato de job que contiene `iqm_token` y no incluye
+`algorithm`: el orquestador selecciona IQM y devuelve `algorithm_requested`.
+Para CPU sí debe especificarse `"algorithm": "cpu"`. Ejecute ambos sobre el
+mismo dataset y conserve la revisión del código de cada ejecución.
 
 ### Referencia exacta en CPU
 
@@ -40,23 +42,26 @@ informa por separado el mejor plan que cubre los diez servicios.
 
 ### QAOA en IQM
 
-`solver_params` de ejemplo:
+El siguiente JSON de configuración IQM se acepta tanto en `solver_params` como
+en `extra_arguments` (el valor real del token se introduce en el job):
 
 ```json
 {
-  "algorithm": "iqm",
-  "qaoa_depth": 1,
-  "shots": 4096,
-  "gamma": 0.8,
-  "beta": 0.35
+  "iqm_token": "<TOKEN_IQM>",
+  "quantum_computer": "emerald",
+  "shots": 2048,
+  "qaoa_depth": 2
 }
 ```
 
-El código actual espera `iqm_token` dentro de `extra_arguments`. Configure el
-valor mediante el mecanismo seguro del entorno de ejecución; **no incorpore el
-token al repositorio ni a este README**. `quantum_computer` es opcional y tiene
-por defecto `emerald`. La URL se toma de `IQM_SERVER_URL` o, si no se define,
-de `https://resonance.iqm.tech/`.
+Se recomienda añadir `"algorithm": "iqm"` para dejar inequívoca la intención.
+El código da prioridad a `solver_params` para `shots`, `qaoa_depth`, `gamma` y
+`beta` cuando un valor aparece en ambos mapas. Para el token y el ordenador da
+prioridad a `extra_arguments`. El ejemplo usa los valores por defecto
+`gamma=0.8` y `beta=0.6`, como en el solver anterior probado. Configure el token mediante el mecanismo seguro del
+entorno de ejecución; **no lo incorpore al repositorio ni a este README**.
+`quantum_computer` tiene por defecto `emerald`. La URL se toma de
+`IQM_SERVER_URL` o, si no se define, de `https://resonance.iqm.tech/`.
 
 Para una prueba explícita en Aer, use `algorithm: "iqm"` y añada
 `{"use_iqm": false}` en `extra_arguments`. En ese caso `backend_used` será
@@ -110,4 +115,4 @@ hardware, colas, repeticiones y el mismo perímetro de medida.
 - La instalación de dependencias, la transpilación para el backend elegido y
   la ejecución real en IQM siguen pendientes de prueba en Q-Centroid.
 
-Referencia de contexto: [caso I
+Referencia de contexto: [caso IQM–Deutsche Bahn](https://arxiv.org/pdf/2606.11383).
