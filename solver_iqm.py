@@ -1,4 +1,4 @@
- """Módulo IQM QAOA llamado por el qcentroid.py de la raíz.
+"""Módulo IQM QAOA llamado por el qcentroid.py de la raíz.
 
 Recibe el JSON completo en run(input_data, solver_params, extra_arguments).
 IQM es el backend por defecto; Aer solo si se solicita use_iqm=False.
@@ -292,9 +292,12 @@ def evaluate_counts(data, counts):
 
 
 def run(input_data, solver_params=None, extra_arguments=None):
-    """Resuelve con QAOA. Los ajustes van en solver_params; token en extra_arguments."""
+    """Resuelve con QAOA; acepta parámetros del job en cualquiera de los mapas."""
     params = solver_params or {}
-    extra = extra_arguments or {}
+    extra = dict(extra_arguments or {})
+    for name in ("iqm_token", "quantum_computer", "use_iqm"):
+        if name not in extra and name in params:
+            extra[name] = params[name]
     validate_dataset(input_data)
     from qiskit import transpile
 
@@ -302,7 +305,7 @@ def run(input_data, solver_params=None, extra_arguments=None):
     depth = int(params.get("qaoa_depth", extra.get("qaoa_depth", 1)))
     shots = int(params.get("shots", extra.get("shots", 4096)))
     gamma = float(params.get("gamma", extra.get("gamma", 0.8)))
-    beta = float(params.get("beta", extra.get("beta", 0.35)))
+    beta = float(params.get("beta", extra.get("beta", 0.6)))
     if depth < 1 or shots < 1:
         raise ValueError("qaoa_depth y shots deben ser positivos")
     ids = [n["id"] for n in input_data["nodes"]]
